@@ -25,6 +25,7 @@ struct ext_power_generic_config {
     const struct gpio_dt_spec *control;
     const size_t control_gpios_count;
     const uint16_t init_delay_ms;
+    const uint16_t init_off_delay_ms;
 };
 
 struct ext_power_generic_data {
@@ -162,6 +163,12 @@ static int ext_power_generic_init(const struct device *dev) {
     k_work_init_delayable(&ext_power_save_work, ext_power_save_state_work);
 #endif
 
+    // Hold power off to allow peripherals with hardware POR circuits
+    // (e.g. trackpoints) to fully discharge their reset capacitors.
+    if (config->init_off_delay_ms) {
+        k_msleep(config->init_off_delay_ms);
+    }
+
     // Enable by default. We may get disabled again once settings load.
     ext_power_enable(dev);
 
@@ -193,7 +200,8 @@ static const struct gpio_dt_spec ext_power_control_gpios[DT_INST_PROP_LEN(0, con
 static const struct ext_power_generic_config config = {
     .control = ext_power_control_gpios,
     .control_gpios_count = DT_INST_PROP_LEN(0, control_gpios),
-    .init_delay_ms = DT_INST_PROP_OR(0, init_delay_ms, 0)};
+    .init_delay_ms = DT_INST_PROP_OR(0, init_delay_ms, 0),
+    .init_off_delay_ms = DT_INST_PROP_OR(0, init_off_delay_ms, 0)};
 
 static struct ext_power_generic_data data = {
     .status = false,

@@ -20,3 +20,11 @@ properties:
     type: int
     description: Number of milliseconds to delay after initializing driver
     required: false
+  init-off-delay-ms:
+    type: int
+    description: |
+      Number of milliseconds to hold external power off during driver
+      initialization before re-enabling. Useful for peripherals (e.g.
+      trackpoints) with hardware power-on-reset circuits that need VCC
+      to remain low long enough for the reset capacitor to discharge.
+    required: false
