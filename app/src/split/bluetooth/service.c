@@ -8,6 +8,7 @@
 #include <zephyr/types.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/init.h>
 
 #include <zephyr/logging/log.h>
@@ -312,6 +313,16 @@ static int zmk_split_bt_sensor_triggered(uint8_t sensor_index,
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
+static atomic_t input_notify_in_flight = ATOMIC_INIT(0);
+
+bool zmk_split_bt_input_notify_ready(uint8_t reg) {
+    return !atomic_get(&input_notify_in_flight);
+}
+
+static void input_notify_complete(struct bt_conn *conn, void *user_data) {
+    atomic_clear(&input_notify_in_flight);
+}
+
 static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, int32_t value,
                                      bool sync) {
 
@@ -326,7 +337,19 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
                 .sync = sync ? 1 : 0,
             };
 
-            return bt_gatt_notify(NULL, &split_svc.attrs[i], &payload, sizeof(payload));
+            struct bt_gatt_notify_params params = {
+                .attr = &split_svc.attrs[i],
+                .data = &payload,
+                .len = sizeof(payload),
+                .func = input_notify_complete,
+            };
+
+            atomic_set(&input_notify_in_flight, 1);
+            int err = bt_gatt_notify_cb(NULL, &params);
+            if (err) {
+                atomic_clear(&input_notify_in_flight);
+            }
+            return err;
         }
     }
     return -ENODEV;

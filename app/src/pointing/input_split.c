@@ -107,6 +107,22 @@ int zmk_input_split_peripheral_disconnected(uint8_t reg) {
 #else
 
 #include <zmk/split/peripheral.h>
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+#include <zmk/split/bluetooth/service.h>
+
+static void split_input_send_event(uint8_t reg, uint8_t type, uint16_t code, int32_t value,
+                                   bool sync) {
+    struct zmk_split_transport_peripheral_event ev = {
+        .type = ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_INPUT_EVENT,
+        .data = {.input_event = {
+                     .reg = reg,
+                     .type = type,
+                     .code = code,
+                     .value = value,
+                     .sync = sync,
+                 }}};
+    zmk_split_peripheral_report_event(&ev);
+}
 
 #define ZIS_INST(n)                                                                                \
     static const struct zmk_input_processor_entry processors_##n[] =                               \
@@ -116,6 +132,9 @@ int zmk_input_split_peripheral_disconnected(uint8_t reg) {
                     ({}));                                                                         \
     BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, device),                                                 \
                  "Peripheral input splits need an `input` property set");                          \
+    static int32_t acc_rel_x_##n;                                                                  \
+    static int32_t acc_rel_y_##n;                                                                  \
+    static bool acc_dirty_##n;                                                                     \
     void split_input_handler_##n(struct input_event *evt, void *user_data) {                       \
         for (size_t i = 0; i < ARRAY_SIZE(processors_##n); i++) {                                  \
             int ret = zmk_input_processor_handle_event(processors_##n[i].dev, evt,                 \
@@ -125,16 +144,32 @@ int zmk_input_split_peripheral_disconnected(uint8_t reg) {
                 return;                                                                            \
             }                                                                                      \
         }                                                                                          \
-        struct zmk_split_transport_peripheral_event ev = {                                         \
-            .type = ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_INPUT_EVENT,                         \
-            .data = {.input_event = {                                                              \
-                         .reg = DT_INST_REG_ADDR(n),                                               \
-                         .type = evt->type,                                                        \
-                         .code = evt->code,                                                        \
-                         .value = evt->value,                                                      \
-                         .sync = evt->sync,                                                        \
-                     }}};                                                                          \
-        zmk_split_peripheral_report_event(&ev);                                                    \
+        if (evt->type == INPUT_EV_REL && evt->code == INPUT_REL_X) {                               \
+            acc_rel_x_##n += evt->value;                                                           \
+            acc_dirty_##n = true;                                                                  \
+        } else if (evt->type == INPUT_EV_REL && evt->code == INPUT_REL_Y) {                        \
+            acc_rel_y_##n += evt->value;                                                           \
+            acc_dirty_##n = true;                                                                  \
+        } else if (evt->sync) {                                                                    \
+            if (zmk_split_bt_input_notify_ready(DT_INST_REG_ADDR(n)) && acc_dirty_##n) {           \
+                if (acc_rel_x_##n != 0) {                                                          \
+                    split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                      \
+                                           INPUT_REL_X, acc_rel_x_##n, false);                     \
+                }                                                                                  \
+                if (acc_rel_y_##n != 0) {                                                          \
+                    split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                      \
+                                           INPUT_REL_Y, acc_rel_y_##n, false);                     \
+                }                                                                                  \
+                split_input_send_event(DT_INST_REG_ADDR(n), evt->type,                             \
+                                       evt->code, evt->value, true);                               \
+                acc_rel_x_##n = 0;                                                                 \
+                acc_rel_y_##n = 0;                                                                 \
+                acc_dirty_##n = false;                                                             \
+            }                                                                                      \
+        } else {                                                                                   \
+            split_input_send_event(DT_INST_REG_ADDR(n), evt->type,                                \
+                                   evt->code, evt->value, evt->sync);                              \
+        }                                                                                          \
     }                                                                                              \
     INPUT_CALLBACK_DEFINE(DEVICE_DT_GET(DT_INST_PHANDLE(n, device)), split_input_handler_##n, NULL);
 
