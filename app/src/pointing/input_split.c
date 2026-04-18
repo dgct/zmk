@@ -135,6 +135,7 @@ static void split_input_send_event(uint8_t reg, uint8_t type, uint16_t code, int
     static int32_t acc_rel_x_##n;                                                                  \
     static int32_t acc_rel_y_##n;                                                                  \
     static bool acc_dirty_##n;                                                                     \
+    static int64_t acc_last_time_##n;                                                              \
     void split_input_handler_##n(struct input_event *evt, void *user_data) {                       \
         for (size_t i = 0; i < ARRAY_SIZE(processors_##n); i++) {                                  \
             int ret = zmk_input_processor_handle_event(processors_##n[i].dev, evt,                 \
@@ -144,12 +145,20 @@ static void split_input_send_event(uint8_t reg, uint8_t type, uint16_t code, int
                 return;                                                                            \
             }                                                                                      \
         }                                                                                          \
+        int64_t now = k_uptime_get();                                                              \
+        if (acc_dirty_##n && (now - acc_last_time_##n) > 1000) {                                   \
+            acc_rel_x_##n = 0;                                                                     \
+            acc_rel_y_##n = 0;                                                                     \
+            acc_dirty_##n = false;                                                                 \
+        }                                                                                          \
         if (evt->type == INPUT_EV_REL && evt->code == INPUT_REL_X) {                               \
             acc_rel_x_##n += evt->value;                                                           \
             acc_dirty_##n = true;                                                                  \
+            acc_last_time_##n = now;                                                               \
         } else if (evt->type == INPUT_EV_REL && evt->code == INPUT_REL_Y) {                        \
             acc_rel_y_##n += evt->value;                                                           \
             acc_dirty_##n = true;                                                                  \
+            acc_last_time_##n = now;                                                               \
         } else {                                                                                   \
             split_input_send_event(DT_INST_REG_ADDR(n), evt->type,                                \
                                    evt->code, evt->value, evt->sync);                              \
