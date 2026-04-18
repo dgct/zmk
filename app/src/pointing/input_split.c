@@ -150,25 +150,25 @@ static void split_input_send_event(uint8_t reg, uint8_t type, uint16_t code, int
         } else if (evt->type == INPUT_EV_REL && evt->code == INPUT_REL_Y) {                        \
             acc_rel_y_##n += evt->value;                                                           \
             acc_dirty_##n = true;                                                                  \
-        } else if (evt->sync) {                                                                    \
-            if (zmk_split_bt_input_notify_ready(DT_INST_REG_ADDR(n)) && acc_dirty_##n) {           \
-                if (acc_rel_x_##n != 0) {                                                          \
-                    split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                      \
-                                           INPUT_REL_X, acc_rel_x_##n, false);                     \
-                }                                                                                  \
-                if (acc_rel_y_##n != 0) {                                                          \
-                    split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                      \
-                                           INPUT_REL_Y, acc_rel_y_##n, false);                     \
-                }                                                                                  \
-                split_input_send_event(DT_INST_REG_ADDR(n), evt->type,                             \
-                                       evt->code, evt->value, true);                               \
-                acc_rel_x_##n = 0;                                                                 \
-                acc_rel_y_##n = 0;                                                                 \
-                acc_dirty_##n = false;                                                             \
-            }                                                                                      \
         } else {                                                                                   \
             split_input_send_event(DT_INST_REG_ADDR(n), evt->type,                                \
                                    evt->code, evt->value, evt->sync);                              \
+        }                                                                                          \
+        if (evt->sync && acc_dirty_##n &&                                                          \
+            zmk_split_bt_input_notify_ready(DT_INST_REG_ADDR(n))) {                                \
+            bool has_x = (acc_rel_x_##n != 0);                                                     \
+            bool has_y = (acc_rel_y_##n != 0);                                                     \
+            if (has_x) {                                                                           \
+                split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                          \
+                                       INPUT_REL_X, acc_rel_x_##n, !has_y);                        \
+            }                                                                                      \
+            if (has_y) {                                                                           \
+                split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                          \
+                                       INPUT_REL_Y, acc_rel_y_##n, true);                          \
+            }                                                                                      \
+            acc_rel_x_##n = 0;                                                                     \
+            acc_rel_y_##n = 0;                                                                     \
+            acc_dirty_##n = false;                                                                 \
         }                                                                                          \
     }                                                                                              \
     INPUT_CALLBACK_DEFINE(DEVICE_DT_GET(DT_INST_PHANDLE(n, device)), split_input_handler_##n, NULL);
