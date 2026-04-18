@@ -4,10 +4,13 @@ manifest:
       url-base: https://github.com/zephyrproject-rtos
     - name: zmkfirmware
       url-base: https://github.com/zmkfirmware
+    - name: dgct
+      url-base: https://github.com/dgct
   projects:
     - name: zephyr
-      remote: zmkfirmware
-      revision: v4.1.0+zmk-fixes
+      remote: dgct
+      # v4.1.0+zmk-fixes + ls0xx VCOM sem/SPI release fix (display freeze)
+      revision: fba7337fd07f13891e858073c10a8926f8301c46
       clone-depth: 1
       import:
         name-blocklist:
