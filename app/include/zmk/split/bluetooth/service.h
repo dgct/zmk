@@ -37,3 +37,7 @@ struct zmk_split_input_event_payload {
     uint32_t value;
     uint8_t sync;
 } __packed;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
+bool zmk_split_bt_input_notify_ready(uint8_t reg);
+#endif
