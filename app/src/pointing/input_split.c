@@ -9,11 +9,15 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/input/input.h>
+#include <zephyr/sys/util.h>
 #include <drivers/input_processor.h>
+#include <zephyr/dt-bindings/input/input-event-codes.h>
 
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+
+#include <zmk/split/bluetooth/service.h>
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 
@@ -45,6 +49,22 @@ int zmk_input_split_report_peripheral_event(uint8_t reg, uint8_t type, uint16_t 
     LOG_DBG("Got peripheral event for %d!", reg);
     for (size_t i = 0; i < ARRAY_SIZE(proxy_inputs); i++) {
         if (reg == proxy_inputs[i].reg) {
+            /* Unpack a coalesced XY event into two input_reports. The peripheral
+             * encodes (int16_t)X in low 16 bits and (int16_t)Y in high 16 bits
+             * to halve the on-air notification count.
+             */
+            if (type == INPUT_EV_REL && code == ZMK_SPLIT_BT_INPUT_PACKED_XY_CODE) {
+                uint32_t packed = (uint32_t)value;
+                int16_t x = (int16_t)(uint16_t)(packed & 0xFFFFU);
+                int16_t y = (int16_t)(uint16_t)((packed >> 16) & 0xFFFFU);
+                int ret = input_report(proxy_inputs[i].dev, INPUT_EV_REL, INPUT_REL_X,
+                                       (int32_t)x, false, K_NO_WAIT);
+                if (ret < 0) {
+                    return ret;
+                }
+                return input_report(proxy_inputs[i].dev, INPUT_EV_REL, INPUT_REL_Y,
+                                    (int32_t)y, sync, K_NO_WAIT);
+            }
             if (type == INPUT_EV_KEY) {
                 uint16_t find, replace;
 
@@ -165,15 +185,24 @@ static void split_input_send_event(uint8_t reg, uint8_t type, uint16_t code, int
         }                                                                                          \
         if (evt->sync && acc_dirty_##n &&                                                          \
             zmk_split_bt_input_notify_ready(DT_INST_REG_ADDR(n))) {                                \
-            bool has_x = (acc_rel_x_##n != 0);                                                     \
-            bool has_y = (acc_rel_y_##n != 0);                                                     \
-            if (has_x) {                                                                           \
+            int32_t cx = CLAMP(acc_rel_x_##n, INT16_MIN, INT16_MAX);                               \
+            int32_t cy = CLAMP(acc_rel_y_##n, INT16_MIN, INT16_MAX);                               \
+            bool has_x = (cx != 0);                                                                \
+            bool has_y = (cy != 0);                                                                \
+            if (has_x && has_y) {                                                                  \
+                /* Pack X (low 16) and Y (high 16) into one notification.        */                \
+                /* Mask through uint16_t to drop sign-extension into upper bits. */                \
+                uint32_t packed = ((uint32_t)(uint16_t)(int16_t)cx) |                              \
+                                  (((uint32_t)(uint16_t)(int16_t)cy) << 16);                       \
                 split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                          \
-                                       INPUT_REL_X, acc_rel_x_##n, !has_y);                        \
-            }                                                                                      \
-            if (has_y) {                                                                           \
+                                       ZMK_SPLIT_BT_INPUT_PACKED_XY_CODE,                          \
+                                       (int32_t)packed, true);                                     \
+            } else if (has_x) {                                                                    \
                 split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                          \
-                                       INPUT_REL_Y, acc_rel_y_##n, true);                          \
+                                       INPUT_REL_X, cx, true);                                     \
+            } else if (has_y) {                                                                    \
+                split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                          \
+                                       INPUT_REL_Y, cy, true);                                     \
             }                                                                                      \
             acc_rel_x_##n = 0;                                                                     \
             acc_rel_y_##n = 0;                                                                     \
