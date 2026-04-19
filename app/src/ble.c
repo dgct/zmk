@@ -509,6 +509,12 @@ static void connected(struct bt_conn *conn, uint8_t err) {
         return;
     }
 
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    // On the split peripheral, the only BT_CONN_ROLE_PERIPHERAL connection is the split link.
+    // Advertising for that is managed by peripheral.c, not here.
+    return;
+#endif
+
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     advertising_status = ZMK_ADV_NONE;
 
@@ -542,6 +548,12 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
         LOG_DBG("SKIPPING FOR ROLE %d", info.role);
         return;
     }
+
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    // On the split peripheral, the only BT_CONN_ROLE_PERIPHERAL connection is the split link.
+    // Advertising for that is managed by peripheral.c (via recycled()), not here.
+    return;
+#endif
 
     // We need to do this in a work callback, otherwise the advertising update will still see the
     // connection for a profile as active, and not start advertising yet.
