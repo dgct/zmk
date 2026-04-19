@@ -314,6 +314,7 @@ static int zmk_split_bt_sensor_triggered(uint8_t sensor_index,
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
 static atomic_t input_notify_in_flight = ATOMIC_INIT(0);
+static int64_t input_notify_in_flight_set_time;
 
 bool zmk_split_bt_input_notify_ready(uint8_t reg) {
     return !atomic_get(&input_notify_in_flight);
@@ -344,9 +345,21 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
                 .func = input_notify_complete,
             };
 
+            int64_t now = k_uptime_get();
+            /* If a prior notify hasn't completed in >500ms, the completion CB
+             * was likely lost (e.g. BLE disconnect mid-flight). Log it so we
+             * can correlate with disconnect events. */
+            if (atomic_get(&input_notify_in_flight) &&
+                (now - input_notify_in_flight_set_time) > 500) {
+                LOG_WRN("input notify in_flight stuck for %lld ms before new notify",
+                        now - input_notify_in_flight_set_time);
+            }
             atomic_set(&input_notify_in_flight, 1);
+            input_notify_in_flight_set_time = now;
             int err = bt_gatt_notify_cb(NULL, &params);
             if (err) {
+                LOG_WRN("bt_gatt_notify_cb err=%d (type=%u code=%u sync=%d) — clearing in_flight",
+                        err, type, code, sync);
                 atomic_clear(&input_notify_in_flight);
             }
             return err;
