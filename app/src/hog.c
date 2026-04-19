@@ -300,10 +300,6 @@ BT_GATT_SERVICE_DEFINE(
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_CTRL_POINT, BT_GATT_CHRC_WRITE_WITHOUT_RESP,
                            BT_GATT_PERM_WRITE, NULL, write_ctrl_point, &ctrl_point));
 
-K_THREAD_STACK_DEFINE(hog_q_stack, CONFIG_ZMK_BLE_THREAD_STACK_SIZE);
-
-struct k_work_q hog_work_q;
-
 K_MSGQ_DEFINE(zmk_hog_keyboard_msgq, sizeof(struct zmk_hid_keyboard_report_body),
               CONFIG_ZMK_BLE_KEYBOARD_REPORT_QUEUE_SIZE, 4);
 
@@ -336,7 +332,7 @@ void send_keyboard_report_callback(struct k_work *work) {
 K_WORK_DEFINE(hog_keyboard_work, send_keyboard_report_callback);
 
 int zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *report) {
-    int err = k_msgq_put(&zmk_hog_keyboard_msgq, report, K_MSEC(100));
+    int err = k_msgq_put(&zmk_hog_keyboard_msgq, report, K_NO_WAIT);
     if (err) {
         switch (err) {
         case -EAGAIN: {
@@ -351,7 +347,7 @@ int zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *report) {
         }
     }
 
-    k_work_submit_to_queue(&hog_work_q, &hog_keyboard_work);
+    k_work_submit(&hog_keyboard_work);
 
     return 0;
 };
@@ -388,7 +384,7 @@ void send_consumer_report_callback(struct k_work *work) {
 K_WORK_DEFINE(hog_consumer_work, send_consumer_report_callback);
 
 int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
-    int err = k_msgq_put(&zmk_hog_consumer_msgq, report, K_MSEC(100));
+    int err = k_msgq_put(&zmk_hog_consumer_msgq, report, K_NO_WAIT);
     if (err) {
         switch (err) {
         case -EAGAIN: {
@@ -403,7 +399,7 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
         }
     }
 
-    k_work_submit_to_queue(&hog_work_q, &hog_consumer_work);
+    k_work_submit(&hog_consumer_work);
 
     return 0;
 };
@@ -441,11 +437,11 @@ void send_mouse_report_callback(struct k_work *work) {
 K_WORK_DEFINE(hog_mouse_work, send_mouse_report_callback);
 
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
-    int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_MSEC(100));
+    int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_NO_WAIT);
     if (err) {
         switch (err) {
         case -EAGAIN: {
-            LOG_WRN("Consumer message queue full, popping first message and queueing again");
+            LOG_WRN("Mouse message queue full, popping first message and queueing again");
             struct zmk_hid_mouse_report_body discarded_report;
             k_msgq_get(&zmk_hog_mouse_msgq, &discarded_report, K_NO_WAIT);
             return zmk_hog_send_mouse_report(report);
@@ -456,18 +452,10 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
         }
     }
 
-    k_work_submit_to_queue(&hog_work_q, &hog_mouse_work);
+    k_work_submit(&hog_mouse_work);
 
     return 0;
 };
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
-static int zmk_hog_init(void) {
-    static const struct k_work_queue_config queue_config = {.name = "HID Over GATT Send Work"};
-    k_work_queue_start(&hog_work_q, hog_q_stack, K_THREAD_STACK_SIZEOF(hog_q_stack),
-                       CONFIG_ZMK_BLE_THREAD_PRIORITY, &queue_config);
 
-    return 0;
-}
-
-SYS_INIT(zmk_hog_init, APPLICATION, CONFIG_ZMK_BLE_INIT_PRIORITY);
