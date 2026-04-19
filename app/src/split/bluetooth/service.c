@@ -29,6 +29,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include "peripheral.h"
 
+#include <zmk/split/bluetooth/peripheral.h>
+
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
 #include <zmk/events/hid_indicators_changed.h>
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
@@ -218,6 +220,10 @@ K_MSGQ_DEFINE(position_state_msgq, sizeof(char[POS_STATE_LEN]),
 void send_position_state_callback(struct k_work *work) {
     uint8_t state[POS_STATE_LEN];
 
+    if (!zmk_split_bt_peripheral_is_connected()) {
+        k_msgq_purge(&position_state_msgq);
+        return;
+    }
     while (k_msgq_get(&position_state_msgq, &state, K_NO_WAIT) == 0) {
         int err = bt_gatt_notify(NULL, &split_svc.attrs[1], &state, sizeof(state));
         if (err) {
@@ -343,6 +349,12 @@ void input_notify_work_cb(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(input_notify_work, input_notify_work_cb);
 
 void input_notify_work_cb(struct k_work *work) {
+    if (!zmk_split_bt_peripheral_is_connected()) {
+        input_notify_retries = 0;
+        atomic_clear(&input_notify_in_flight);
+        return;
+    }
+
     struct bt_gatt_notify_params params = {
         .attr = pending_input_attr,
         .data = &pending_input_payload,
