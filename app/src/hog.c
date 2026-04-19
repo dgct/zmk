@@ -300,13 +300,25 @@ BT_GATT_SERVICE_DEFINE(
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_CTRL_POINT, BT_GATT_CHRC_WRITE_WITHOUT_RESP,
                            BT_GATT_PERM_WRITE, NULL, write_ctrl_point, &ctrl_point));
 
+#define HOG_NOTIFY_MAX_RETRIES 10
+
+static void hog_notify_complete(struct bt_conn *conn, void *user_data) {
+    struct k_work_delayable *work = (struct k_work_delayable *)user_data;
+    k_work_reschedule(work, K_NO_WAIT);
+}
+
 K_MSGQ_DEFINE(zmk_hog_keyboard_msgq, sizeof(struct zmk_hid_keyboard_report_body),
               CONFIG_ZMK_BLE_KEYBOARD_REPORT_QUEUE_SIZE, 4);
+
+static int hog_keyboard_retries;
+
+void send_keyboard_report_callback(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(hog_keyboard_work, send_keyboard_report_callback);
 
 void send_keyboard_report_callback(struct k_work *work) {
     struct zmk_hid_keyboard_report_body report;
 
-    while (k_msgq_get(&zmk_hog_keyboard_msgq, &report, K_NO_WAIT) == 0) {
+    while (k_msgq_peek(&zmk_hog_keyboard_msgq, &report) == 0) {
         struct bt_conn *conn = zmk_ble_active_profile_conn();
         if (conn == NULL) {
             return;
@@ -316,9 +328,27 @@ void send_keyboard_report_callback(struct k_work *work) {
             .attr = &hog_svc.attrs[5],
             .data = &report,
             .len = sizeof(report),
+            .func = hog_notify_complete,
+            .user_data = &hog_keyboard_work,
         };
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
+        if (err == -ENOMEM) {
+            bt_conn_unref(conn);
+            if (++hog_keyboard_retries > HOG_NOTIFY_MAX_RETRIES) {
+                LOG_WRN("ATT exhaustion: dropping keyboard queue (%d retries)",
+                        HOG_NOTIFY_MAX_RETRIES);
+                k_msgq_purge(&zmk_hog_keyboard_msgq);
+                hog_keyboard_retries = 0;
+                return;
+            }
+            k_work_schedule(&hog_keyboard_work, K_MSEC(2));
+            return;
+        }
+
+        k_msgq_get(&zmk_hog_keyboard_msgq, &report, K_NO_WAIT);
+        hog_keyboard_retries = 0;
+
         if (err == -EPERM) {
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
@@ -328,8 +358,6 @@ void send_keyboard_report_callback(struct k_work *work) {
         bt_conn_unref(conn);
     }
 }
-
-K_WORK_DEFINE(hog_keyboard_work, send_keyboard_report_callback);
 
 int zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *report) {
     int err = k_msgq_put(&zmk_hog_keyboard_msgq, report, K_NO_WAIT);
@@ -347,7 +375,7 @@ int zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *report) {
         }
     }
 
-    k_work_submit(&hog_keyboard_work);
+    k_work_schedule(&hog_keyboard_work, K_NO_WAIT);
 
     return 0;
 };
@@ -355,10 +383,15 @@ int zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *report) {
 K_MSGQ_DEFINE(zmk_hog_consumer_msgq, sizeof(struct zmk_hid_consumer_report_body),
               CONFIG_ZMK_BLE_CONSUMER_REPORT_QUEUE_SIZE, 4);
 
+static int hog_consumer_retries;
+
+void send_consumer_report_callback(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(hog_consumer_work, send_consumer_report_callback);
+
 void send_consumer_report_callback(struct k_work *work) {
     struct zmk_hid_consumer_report_body report;
 
-    while (k_msgq_get(&zmk_hog_consumer_msgq, &report, K_NO_WAIT) == 0) {
+    while (k_msgq_peek(&zmk_hog_consumer_msgq, &report) == 0) {
         struct bt_conn *conn = zmk_ble_active_profile_conn();
         if (conn == NULL) {
             return;
@@ -368,9 +401,27 @@ void send_consumer_report_callback(struct k_work *work) {
             .attr = &hog_svc.attrs[9],
             .data = &report,
             .len = sizeof(report),
+            .func = hog_notify_complete,
+            .user_data = &hog_consumer_work,
         };
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
+        if (err == -ENOMEM) {
+            bt_conn_unref(conn);
+            if (++hog_consumer_retries > HOG_NOTIFY_MAX_RETRIES) {
+                LOG_WRN("ATT exhaustion: dropping consumer queue (%d retries)",
+                        HOG_NOTIFY_MAX_RETRIES);
+                k_msgq_purge(&zmk_hog_consumer_msgq);
+                hog_consumer_retries = 0;
+                return;
+            }
+            k_work_schedule(&hog_consumer_work, K_MSEC(2));
+            return;
+        }
+
+        k_msgq_get(&zmk_hog_consumer_msgq, &report, K_NO_WAIT);
+        hog_consumer_retries = 0;
+
         if (err == -EPERM) {
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
@@ -380,8 +431,6 @@ void send_consumer_report_callback(struct k_work *work) {
         bt_conn_unref(conn);
     }
 };
-
-K_WORK_DEFINE(hog_consumer_work, send_consumer_report_callback);
 
 int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
     int err = k_msgq_put(&zmk_hog_consumer_msgq, report, K_NO_WAIT);
@@ -399,7 +448,7 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
         }
     }
 
-    k_work_submit(&hog_consumer_work);
+    k_work_schedule(&hog_consumer_work, K_NO_WAIT);
 
     return 0;
 };
@@ -409,9 +458,14 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
 K_MSGQ_DEFINE(zmk_hog_mouse_msgq, sizeof(struct zmk_hid_mouse_report_body),
               CONFIG_ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE, 4);
 
+static int hog_mouse_retries;
+
+void send_mouse_report_callback(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(hog_mouse_work, send_mouse_report_callback);
+
 void send_mouse_report_callback(struct k_work *work) {
     struct zmk_hid_mouse_report_body report;
-    while (k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT) == 0) {
+    while (k_msgq_peek(&zmk_hog_mouse_msgq, &report) == 0) {
         struct bt_conn *conn = zmk_ble_active_profile_conn();
         if (conn == NULL) {
             return;
@@ -421,9 +475,27 @@ void send_mouse_report_callback(struct k_work *work) {
             .attr = &hog_svc.attrs[13],
             .data = &report,
             .len = sizeof(report),
+            .func = hog_notify_complete,
+            .user_data = &hog_mouse_work,
         };
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
+        if (err == -ENOMEM) {
+            bt_conn_unref(conn);
+            if (++hog_mouse_retries > HOG_NOTIFY_MAX_RETRIES) {
+                LOG_WRN("ATT exhaustion: dropping mouse queue (%d retries)",
+                        HOG_NOTIFY_MAX_RETRIES);
+                k_msgq_purge(&zmk_hog_mouse_msgq);
+                hog_mouse_retries = 0;
+                return;
+            }
+            k_work_schedule(&hog_mouse_work, K_MSEC(2));
+            return;
+        }
+
+        k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT);
+        hog_mouse_retries = 0;
+
         if (err == -EPERM) {
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
@@ -433,8 +505,6 @@ void send_mouse_report_callback(struct k_work *work) {
         bt_conn_unref(conn);
     }
 };
-
-K_WORK_DEFINE(hog_mouse_work, send_mouse_report_callback);
 
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
     int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_NO_WAIT);
@@ -452,7 +522,7 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
         }
     }
 
-    k_work_submit(&hog_mouse_work);
+    k_work_schedule(&hog_mouse_work, K_NO_WAIT);
 
     return 0;
 };
