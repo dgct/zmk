@@ -244,7 +244,7 @@ int send_position_state() {
         }
     }
 
-    k_work_submit_to_queue(&service_work_q, &service_position_notify_work);
+    k_work_submit(&service_position_notify_work);
 
     return 0;
 }
@@ -292,7 +292,7 @@ int send_sensor_state(struct sensor_event ev) {
         }
     }
 
-    k_work_submit_to_queue(&service_work_q, &service_sensor_notify_work);
+    k_work_submit(&service_sensor_notify_work);
     return 0;
 }
 
@@ -317,12 +317,41 @@ static atomic_t input_notify_in_flight = ATOMIC_INIT(0);
 static int64_t input_notify_in_flight_set_time;
 
 bool zmk_split_bt_input_notify_ready(uint8_t reg) {
-    return !atomic_get(&input_notify_in_flight);
+    if (atomic_get(&input_notify_in_flight)) {
+        int64_t elapsed = k_uptime_get() - input_notify_in_flight_set_time;
+        if (elapsed > 500) {
+            LOG_WRN("input_notify_in_flight stuck for %lld ms, auto-clearing", elapsed);
+            atomic_clear(&input_notify_in_flight);
+            return true;
+        }
+        return false;
+    }
+    return true;
 }
 
 static void input_notify_complete(struct bt_conn *conn, void *user_data) {
     atomic_clear(&input_notify_in_flight);
 }
+
+static struct zmk_split_input_event_payload pending_input_payload;
+static const struct bt_gatt_attr *pending_input_attr;
+
+static void input_notify_work_cb(struct k_work *work) {
+    struct bt_gatt_notify_params params = {
+        .attr = pending_input_attr,
+        .data = &pending_input_payload,
+        .len = sizeof(pending_input_payload),
+        .func = input_notify_complete,
+    };
+
+    int err = bt_gatt_notify_cb(NULL, &params);
+    if (err) {
+        LOG_WRN("input notify work err=%d, clearing in_flight", err);
+        atomic_clear(&input_notify_in_flight);
+    }
+}
+
+K_WORK_DEFINE(input_notify_work, input_notify_work_cb);
 
 static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, int32_t value,
                                      bool sync) {
@@ -331,38 +360,18 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
         if (bt_uuid_cmp(split_svc.attrs[i].uuid,
                         BT_UUID_DECLARE_128(ZMK_SPLIT_BT_INPUT_EVENT_UUID)) == 0 &&
             (uint8_t)(uint32_t)split_svc.attrs[i + 2].user_data == reg) {
-            struct zmk_split_input_event_payload payload = {
+            pending_input_payload = (struct zmk_split_input_event_payload){
                 .type = type,
                 .code = code,
                 .value = value,
                 .sync = sync ? 1 : 0,
             };
+            pending_input_attr = &split_svc.attrs[i];
 
-            struct bt_gatt_notify_params params = {
-                .attr = &split_svc.attrs[i],
-                .data = &payload,
-                .len = sizeof(payload),
-                .func = input_notify_complete,
-            };
-
-            int64_t now = k_uptime_get();
-            /* If a prior notify hasn't completed in >500ms, the completion CB
-             * was likely lost (e.g. BLE disconnect mid-flight). Log it so we
-             * can correlate with disconnect events. */
-            if (atomic_get(&input_notify_in_flight) &&
-                (now - input_notify_in_flight_set_time) > 500) {
-                LOG_WRN("input notify in_flight stuck for %lld ms before new notify",
-                        now - input_notify_in_flight_set_time);
-            }
             atomic_set(&input_notify_in_flight, 1);
-            input_notify_in_flight_set_time = now;
-            int err = bt_gatt_notify_cb(NULL, &params);
-            if (err) {
-                LOG_WRN("bt_gatt_notify_cb err=%d (type=%u code=%u sync=%d) — clearing in_flight",
-                        err, type, code, sync);
-                atomic_clear(&input_notify_in_flight);
-            }
-            return err;
+            input_notify_in_flight_set_time = k_uptime_get();
+            k_work_submit(&input_notify_work);
+            return 0;
         }
     }
     return -ENODEV;
