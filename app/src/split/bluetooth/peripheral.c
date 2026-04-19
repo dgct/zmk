@@ -76,9 +76,13 @@ static bool low_duty_advertising = false;
 static bool enabled = false;
 
 static void advertising_cb(struct k_work *work) {
+    // Stop any stale advertising (e.g. from ble.c) before starting split advertising.
+    bt_le_adv_stop();
     const int err = start_advertising(low_duty_advertising);
     if (err < 0) {
         LOG_ERR("Failed to start advertising (%d)", err);
+    } else {
+        LOG_DBG("Split advertising started (low_duty=%d)", low_duty_advertising);
     }
 }
 
@@ -97,6 +101,7 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 }
 
 static void recycled(void) {
+    LOG_DBG("Connection recycled, restarting advertising (enabled=%d)", enabled);
     if (enabled) {
         low_duty_advertising = false;
         k_work_submit(&advertising_work);
