@@ -333,10 +333,16 @@ static void input_notify_complete(struct bt_conn *conn, void *user_data) {
     atomic_clear(&input_notify_in_flight);
 }
 
+#define INPUT_NOTIFY_MAX_RETRIES 10
+
 static struct zmk_split_input_event_payload pending_input_payload;
 static const struct bt_gatt_attr *pending_input_attr;
+static int input_notify_retries;
 
-static void input_notify_work_cb(struct k_work *work) {
+void input_notify_work_cb(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(input_notify_work, input_notify_work_cb);
+
+void input_notify_work_cb(struct k_work *work) {
     struct bt_gatt_notify_params params = {
         .attr = pending_input_attr,
         .data = &pending_input_payload,
@@ -345,13 +351,24 @@ static void input_notify_work_cb(struct k_work *work) {
     };
 
     int err = bt_gatt_notify_cb(NULL, &params);
+    if (err == -ENOMEM) {
+        if (++input_notify_retries > INPUT_NOTIFY_MAX_RETRIES) {
+            LOG_WRN("ATT exhaustion: dropping input notify (%d retries)",
+                    INPUT_NOTIFY_MAX_RETRIES);
+            input_notify_retries = 0;
+            atomic_clear(&input_notify_in_flight);
+            return;
+        }
+        k_work_schedule(&input_notify_work, K_MSEC(5));
+        return;
+    }
+
+    input_notify_retries = 0;
     if (err) {
         LOG_WRN("input notify work err=%d, clearing in_flight", err);
         atomic_clear(&input_notify_in_flight);
     }
 }
-
-K_WORK_DEFINE(input_notify_work, input_notify_work_cb);
 
 static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, int32_t value,
                                      bool sync) {
@@ -370,7 +387,8 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
 
             atomic_set(&input_notify_in_flight, 1);
             input_notify_in_flight_set_time = k_uptime_get();
-            k_work_submit(&input_notify_work);
+            input_notify_retries = 0;
+            k_work_schedule(&input_notify_work, K_NO_WAIT);
             return 0;
         }
     }
