@@ -320,13 +320,19 @@ static int zmk_split_bt_sensor_triggered(uint8_t sensor_index,
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
 static atomic_t input_notify_in_flight = ATOMIC_INIT(0);
-static int64_t input_notify_in_flight_set_time;
+/* 32-bit ms timestamp held in an atomic so reads and writes are tear-free on
+ * 32-bit targets. k_uptime_get_32() wraps every ~49.7 days; unsigned
+ * subtraction below is wraparound-safe for the 500 ms threshold.
+ */
+static atomic_t input_notify_in_flight_set_time = ATOMIC_INIT(0);
 
 bool zmk_split_bt_input_notify_ready(uint8_t reg) {
     if (atomic_get(&input_notify_in_flight)) {
-        int64_t elapsed = k_uptime_get() - input_notify_in_flight_set_time;
+        uint32_t now = k_uptime_get_32();
+        uint32_t set = (uint32_t)atomic_get(&input_notify_in_flight_set_time);
+        uint32_t elapsed = now - set;
         if (elapsed > 500) {
-            LOG_WRN("input_notify_in_flight stuck for %lld ms, auto-clearing", elapsed);
+            LOG_WRN("input_notify_in_flight stuck for %u ms, auto-clearing", elapsed);
             atomic_clear(&input_notify_in_flight);
             return true;
         }
@@ -397,8 +403,8 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
             };
             pending_input_attr = &split_svc.attrs[i];
 
+            atomic_set(&input_notify_in_flight_set_time, (atomic_val_t)k_uptime_get_32());
             atomic_set(&input_notify_in_flight, 1);
-            input_notify_in_flight_set_time = k_uptime_get();
             input_notify_retries = 0;
             k_work_schedule(&input_notify_work, K_NO_WAIT);
             return 0;
