@@ -63,6 +63,15 @@ struct peripheral_slot {
     uint16_t selected_physical_layout_handle;
     uint8_t position_state[POSITION_STATE_DATA_LEN];
     uint8_t changed_positions[POSITION_STATE_DATA_LEN];
+#if IS_ENABLED(CONFIG_BT_GATT_NOTIFY_MULTIPLE)
+    /* P2: Client Supported Features write — tells peripheral we accept
+     * the ATT_HANDLE_VALUE_NTF_MULT (0x23) PDU so it can coalesce notifies.
+     */
+    struct bt_gatt_discover_params csf_discover_params;
+    struct bt_gatt_write_params csf_write_params;
+    uint8_t csf_value;
+    bool csf_written;
+#endif
 };
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
@@ -222,6 +231,12 @@ int release_peripheral_slot(int index) {
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
     slot->update_hid_indicators = 0;
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
+#if IS_ENABLED(CONFIG_BT_GATT_NOTIFY_MULTIPLE)
+    /* Re-write CSF on next discovery — peripheral may have lost it
+     * (e.g. peer reflashed without persisted bonds). Idempotent if still set.
+     */
+    slot->csf_written = false;
+#endif
 
     return 0;
 }
@@ -538,6 +553,77 @@ static void update_peripherals_selected_physical_layout(struct k_work *_work) {
 K_WORK_DEFINE(update_peripherals_selected_layouts_work,
               update_peripherals_selected_physical_layout);
 
+
+#if IS_ENABLED(CONFIG_BT_GATT_NOTIFY_MULTIPLE)
+/* P2: After split-service subscriptions complete, write Client Supported
+ * Features bit 2 on the peripheral so it auto-coalesces our concurrent
+ * notifies into a single ATT_HANDLE_VALUE_NTF_MULT (opcode 0x23) PDU.
+ * Reduces ATT pool consumption by ~4× and is the primary mitigation for
+ * Bug 6 freezes. With BT_SETTINGS, the peripheral persists CSF per bonded
+ * peer; we always re-write on (re)discovery — it's idempotent.
+ */
+static void csf_write_cb(struct bt_conn *conn, uint8_t err,
+                         struct bt_gatt_write_params *params) {
+    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
+    if (err) {
+        LOG_WRN("CSF write failed (att err 0x%02x) — peripheral will use "
+                "regular NOTIFY (no coalescing)",
+                err);
+        return;
+    }
+    if (slot) {
+        slot->csf_written = true;
+    }
+    LOG_DBG("CSF bit 2 written — peripheral may now coalesce notifies");
+}
+
+static uint8_t csf_discovery_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                  struct bt_gatt_discover_params *params) {
+    if (!attr) {
+        LOG_WRN("CSF characteristic not found on peripheral — "
+                "BT_GATT_CACHING may not be enabled there");
+        return BT_GATT_ITER_STOP;
+    }
+
+    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
+    if (!slot) {
+        return BT_GATT_ITER_STOP;
+    }
+
+    uint16_t value_handle = bt_gatt_attr_value_handle(attr);
+    LOG_DBG("Found CSF characteristic, value handle %u", value_handle);
+
+    /* CF_BIT_NOTIFY_MULTI = bit 2 (matches Zephyr gatt.c) */
+    slot->csf_value = BIT(2);
+    slot->csf_write_params.func = csf_write_cb;
+    slot->csf_write_params.handle = value_handle;
+    slot->csf_write_params.offset = 0;
+    slot->csf_write_params.data = &slot->csf_value;
+    slot->csf_write_params.length = sizeof(slot->csf_value);
+
+    int err = bt_gatt_write(conn, &slot->csf_write_params);
+    if (err) {
+        LOG_WRN("Failed to start CSF write (err %d)", err);
+    }
+    return BT_GATT_ITER_STOP;
+}
+
+static void split_central_write_csf(struct bt_conn *conn, struct peripheral_slot *slot) {
+    LOG_DBG("Discovering Client Supported Features (UUID 0x2b29)");
+    slot->csf_discover_params.uuid = BT_UUID_GATT_CLIENT_FEATURES;
+    slot->csf_discover_params.func = csf_discovery_func;
+    slot->csf_discover_params.start_handle = 0x0001;
+    slot->csf_discover_params.end_handle = 0xffff;
+    slot->csf_discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+    int err = bt_gatt_discover(conn, &slot->csf_discover_params);
+    if (err) {
+        LOG_WRN("Failed to start CSF discovery (err %d)", err);
+    }
+}
+#endif /* CONFIG_BT_GATT_NOTIFY_MULTIPLE */
+
+
 static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
                                                  const struct bt_gatt_attr *attr,
                                                  struct bt_gatt_discover_params *params) {
@@ -709,6 +795,18 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
         }
     }
 #endif // IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
+
+#if IS_ENABLED(CONFIG_BT_GATT_NOTIFY_MULTIPLE)
+    /* All split-service subscriptions are done — kick off CSF write so the
+     * peripheral knows it can pack our notifies into ATT_NOTIFY_MULT PDUs.
+     * Re-issued on each (re)discovery; the write is idempotent.
+     * Uses a separate discover_params struct so this doesn't disturb the
+     * main split-service discovery state machine.
+     */
+    if (subscribed && !slot->csf_written) {
+        split_central_write_csf(conn, slot);
+    }
+#endif /* CONFIG_BT_GATT_NOTIFY_MULTIPLE */
 
     return subscribed ? BT_GATT_ITER_STOP : BT_GATT_ITER_CONTINUE;
 }
