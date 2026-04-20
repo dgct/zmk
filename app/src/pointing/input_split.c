@@ -156,6 +156,51 @@ static void split_input_send_event(uint8_t reg, uint8_t type, uint16_t code, int
     static int32_t acc_rel_y_##n;                                                                  \
     static bool acc_dirty_##n;                                                                     \
     static int64_t acc_last_time_##n;                                                              \
+    static struct k_spinlock acc_lock_##n;                                                         \
+    static void zis_do_flush_##n(void) {                                                           \
+        /* Atomically snapshot+drain the accumulator into local cx/cy, leaving any                 \
+         * residual (post-CLAMP) behind. Spinlock is taken only across the                         \
+         * read-modify-write of acc state — never across the BLE send. */                          \
+        k_spinlock_key_t key = k_spin_lock(&acc_lock_##n);                                         \
+        if (!acc_dirty_##n ||                                                                      \
+            !zmk_split_bt_input_notify_ready(DT_INST_REG_ADDR(n))) {                               \
+            k_spin_unlock(&acc_lock_##n, key);                                                     \
+            return;                                                                                \
+        }                                                                                          \
+        int32_t cx = CLAMP(acc_rel_x_##n, INT16_MIN, INT16_MAX);                                   \
+        int32_t cy = CLAMP(acc_rel_y_##n, INT16_MIN, INT16_MAX);                                   \
+        acc_rel_x_##n -= cx;                                                                       \
+        acc_rel_y_##n -= cy;                                                                       \
+        acc_dirty_##n = (acc_rel_x_##n != 0) || (acc_rel_y_##n != 0);                              \
+        k_spin_unlock(&acc_lock_##n, key);                                                         \
+        bool has_x = (cx != 0);                                                                    \
+        bool has_y = (cy != 0);                                                                    \
+        if (has_x && has_y) {                                                                      \
+            uint32_t packed = ((uint32_t)(uint16_t)(int16_t)cx) |                                  \
+                              (((uint32_t)(uint16_t)(int16_t)cy) << 16);                           \
+            split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                              \
+                                   ZMK_SPLIT_BT_INPUT_PACKED_XY_CODE,                              \
+                                   (int32_t)packed, true);                                         \
+        } else if (has_x) {                                                                        \
+            split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                              \
+                                   INPUT_REL_X, cx, true);                                         \
+        } else if (has_y) {                                                                        \
+            split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                              \
+                                   INPUT_REL_Y, cy, true);                                         \
+        }                                                                                          \
+    }                                                                                              \
+    IF_ENABLED(UTIL_BOOL(CONFIG_ZMK_INPUT_SPLIT_FLUSH_MS), (                                       \
+    static void zis_flush_work_handler_##n(struct k_work *work) {                                  \
+        zis_do_flush_##n();                                                                        \
+        /* If notify wasn't ready, or new motion arrived during the send,                          \
+         * acc_dirty_##n is still true — re-arm the timer. */                                      \
+        if (acc_dirty_##n) {                                                                       \
+            k_work_reschedule(k_work_delayable_from_work(work),                                    \
+                              K_MSEC(CONFIG_ZMK_INPUT_SPLIT_FLUSH_MS));                            \
+        }                                                                                          \
+    }                                                                                              \
+    static K_WORK_DELAYABLE_DEFINE(zis_flush_work_##n, zis_flush_work_handler_##n);                \
+    ))                                                                                             \
     void split_input_handler_##n(struct input_event *evt, void *user_data) {                       \
         for (size_t i = 0; i < ARRAY_SIZE(processors_##n); i++) {                                  \
             int ret = zmk_input_processor_handle_event(processors_##n[i].dev, evt,                 \
@@ -166,49 +211,45 @@ static void split_input_send_event(uint8_t reg, uint8_t type, uint16_t code, int
             }                                                                                      \
         }                                                                                          \
         int64_t now = k_uptime_get();                                                              \
+        k_spinlock_key_t key = k_spin_lock(&acc_lock_##n);                                         \
         if (acc_dirty_##n && (now - acc_last_time_##n) > 1000) {                                   \
             acc_rel_x_##n = 0;                                                                     \
             acc_rel_y_##n = 0;                                                                     \
             acc_dirty_##n = false;                                                                 \
         }                                                                                          \
-        if (evt->type == INPUT_EV_REL && evt->code == INPUT_REL_X) {                               \
-            acc_rel_x_##n += evt->value;                                                           \
+        bool is_rel_xy = (evt->type == INPUT_EV_REL) &&                                            \
+                         (evt->code == INPUT_REL_X || evt->code == INPUT_REL_Y);                   \
+        if (is_rel_xy) {                                                                           \
+            if (evt->code == INPUT_REL_X) {                                                        \
+                acc_rel_x_##n += evt->value;                                                       \
+            } else {                                                                               \
+                acc_rel_y_##n += evt->value;                                                       \
+            }                                                                                      \
             acc_dirty_##n = true;                                                                  \
             acc_last_time_##n = now;                                                               \
-        } else if (evt->type == INPUT_EV_REL && evt->code == INPUT_REL_Y) {                        \
-            acc_rel_y_##n += evt->value;                                                           \
-            acc_dirty_##n = true;                                                                  \
-            acc_last_time_##n = now;                                                               \
-        } else {                                                                                   \
-            split_input_send_event(DT_INST_REG_ADDR(n), evt->type,                                \
+        }                                                                                          \
+        k_spin_unlock(&acc_lock_##n, key);                                                         \
+        if (!is_rel_xy) {                                                                          \
+            /* Non-REL event (button, key, etc.). In timer-gated mode, pre-flush                   \
+             * any pending motion FIRST so the central sees move-then-click. In                    \
+             * legacy mode (FLUSH_MS=0), preserve historical behaviour: send the                   \
+             * non-REL immediately, motion flushes after via the sync block below. */              \
+            IF_ENABLED(UTIL_BOOL(CONFIG_ZMK_INPUT_SPLIT_FLUSH_MS), (                               \
+                if (acc_dirty_##n) {                                                               \
+                    k_work_cancel_delayable(&zis_flush_work_##n);                                  \
+                    zis_do_flush_##n();                                                            \
+                }                                                                                  \
+            ))                                                                                     \
+            split_input_send_event(DT_INST_REG_ADDR(n), evt->type,                                 \
                                    evt->code, evt->value, evt->sync);                              \
         }                                                                                          \
-        if (evt->sync && acc_dirty_##n &&                                                          \
-            zmk_split_bt_input_notify_ready(DT_INST_REG_ADDR(n))) {                                \
-            int32_t cx = CLAMP(acc_rel_x_##n, INT16_MIN, INT16_MAX);                               \
-            int32_t cy = CLAMP(acc_rel_y_##n, INT16_MIN, INT16_MAX);                               \
-            bool has_x = (cx != 0);                                                                \
-            bool has_y = (cy != 0);                                                                \
-            if (has_x && has_y) {                                                                  \
-                /* Pack X (low 16) and Y (high 16) into one notification.        */                \
-                /* Mask through uint16_t to drop sign-extension into upper bits. */                \
-                uint32_t packed = ((uint32_t)(uint16_t)(int16_t)cx) |                              \
-                                  (((uint32_t)(uint16_t)(int16_t)cy) << 16);                       \
-                split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                          \
-                                       ZMK_SPLIT_BT_INPUT_PACKED_XY_CODE,                          \
-                                       (int32_t)packed, true);                                     \
-            } else if (has_x) {                                                                    \
-                split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                          \
-                                       INPUT_REL_X, cx, true);                                     \
-            } else if (has_y) {                                                                    \
-                split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                          \
-                                       INPUT_REL_Y, cy, true);                                     \
-            }                                                                                      \
-            /* Preserve any residual motion CLAMP truncated (saturating flush). */                 \
-            /* In branches where we did not send an axis, cx/cy is 0, so this is a no-op. */       \
-            acc_rel_x_##n -= cx;                                                                   \
-            acc_rel_y_##n -= cy;                                                                   \
-            acc_dirty_##n = (acc_rel_x_##n != 0) || (acc_rel_y_##n != 0);                          \
+        if (evt->sync && acc_dirty_##n) {                                                          \
+            COND_CODE_1(UTIL_BOOL(CONFIG_ZMK_INPUT_SPLIT_FLUSH_MS),                                \
+                (k_work_schedule(&zis_flush_work_##n,                                              \
+                                 K_MSEC(CONFIG_ZMK_INPUT_SPLIT_FLUSH_MS));),                       \
+                (if (zmk_split_bt_input_notify_ready(DT_INST_REG_ADDR(n))) {                       \
+                    zis_do_flush_##n();                                                            \
+                 }))                                                                               \
         }                                                                                          \
     }                                                                                              \
     INPUT_CALLBACK_DEFINE(DEVICE_DT_GET(DT_INST_PHANDLE(n, device)), split_input_handler_##n, NULL);

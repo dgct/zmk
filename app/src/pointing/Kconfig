@@ -83,6 +83,22 @@ config ZMK_INPUT_SPLIT_MAX_TRACKED_KEYS
     int "Input Split max tracked keys to release on peripheral disconnect"
     default 5
 
+config ZMK_INPUT_SPLIT_FLUSH_MS
+    int "Peripheral REL_X/REL_Y accumulator flush period (ms, 0=legacy)"
+    default 40
+    range 0 200
+    help
+      When > 0, accumulated REL_X/REL_Y motion on the peripheral side is
+      flushed via a deferred work item every N ms instead of on every input
+      sync. Reduces BLE GATT notification rate (and ATT TX buffer pressure)
+      at the cost of up to N ms of added cursor latency. Default 40 ms ≈
+      ~3 PS/2 samples per flush at 80 Hz, lowering notify rate from ~80/s
+      to ~25/s. Set to 0 to restore legacy flush-on-every-sync behavior.
+
+      Non-REL events (buttons, keys) trigger an immediate pre-flush so
+      that motion arrives at the central before any subsequent click,
+      preserving move-then-click ordering.
+
 endif # ZMK_INPUT_SPLIT
 
 endif # ZMK_POINTING
