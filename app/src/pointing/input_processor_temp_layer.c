@@ -64,22 +64,6 @@ static bool should_quick_tap(const struct temp_layer_config *config, int64_t las
     return (last_tapped + config->require_prior_idle_ms) > current_time;
 }
 
-/* Layer State Management */
-static void update_layer_state(struct temp_layer_state *state, bool activate) {
-    if (state->is_active == activate) {
-        return;
-    }
-
-    state->is_active = activate;
-    if (activate) {
-        zmk_keymap_layer_activate(state->toggle_layer, false);
-        LOG_DBG("Layer %d activated", state->toggle_layer);
-    } else {
-        zmk_keymap_layer_deactivate(state->toggle_layer, false);
-        LOG_DBG("Layer %d deactivated", state->toggle_layer);
-    }
-}
-
 struct layer_state_action {
     uint8_t layer;
     bool activate;
@@ -88,30 +72,61 @@ struct layer_state_action {
 K_MSGQ_DEFINE(temp_layer_action_msgq, sizeof(struct layer_state_action),
               CONFIG_ZMK_INPUT_PROCESSOR_TEMP_LAYER_MAX_ACTION_EVENTS, 4);
 
+/* Drains the action msgq and applies layer transitions WITHOUT holding
+ * data->lock across the synchronous zmk_layer_state_changed fan-out.
+ *
+ * The fan-out reaches conditional_layer (recursive cascade), display
+ * widgets (k_work_submit, brief), and this file's own L2 handler
+ * (handle_layer_state_changed).  In the previous implementation the
+ * fan-out ran under data->lock, blocking the input thread (L5,
+ * temp_layer_handle_event) for the full chain duration on K_FOREVER.
+ *
+ * This callback runs on the system workqueue, which is single-threaded,
+ * so no other sysworkq item can interleave between unlock and the
+ * keymap call.  Only L5 (input thread) can observe data->state during
+ * that window; its only effect is to enqueue more actions and submit
+ * this work again, so any temporary inconsistency between is_active
+ * and the actual keymap layer state is invisible to layer routing.
+ */
 static void layer_action_work_cb(struct k_work *work) {
-
     const struct device *dev = DEVICE_DT_INST_GET(0);
     struct temp_layer_data *data = (struct temp_layer_data *)dev->data;
-
-    int ret = k_mutex_lock(&data->lock, K_FOREVER);
-    if (ret < 0) {
-        LOG_ERR("Error locking for updating %d", ret);
-        return;
-    }
-
     struct layer_state_action action;
 
-    while (k_msgq_get(&temp_layer_action_msgq, &action, K_MSEC(10)) >= 0) {
+    while (k_msgq_get(&temp_layer_action_msgq, &action, K_NO_WAIT) >= 0) {
+        int ret = k_mutex_lock(&data->lock, K_FOREVER);
+        if (ret < 0) {
+            LOG_ERR("Error locking for updating %d", ret);
+            return;
+        }
+
+        bool need_keymap_call = false;
+        uint8_t target_layer = data->state.toggle_layer;
+
         if (!action.activate) {
-            if (zmk_keymap_layer_active(action.layer)) {
-                update_layer_state(&data->state, false);
+            if (zmk_keymap_layer_active(action.layer) && data->state.is_active) {
+                data->state.is_active = false;
+                need_keymap_call = true;
             }
         } else {
-            update_layer_state(&data->state, true);
+            if (!data->state.is_active) {
+                data->state.is_active = true;
+                need_keymap_call = true;
+            }
+        }
+
+        k_mutex_unlock(&data->lock);
+
+        if (need_keymap_call) {
+            if (action.activate) {
+                zmk_keymap_layer_activate(target_layer, false);
+                LOG_DBG("Layer %d activated", target_layer);
+            } else {
+                zmk_keymap_layer_deactivate(target_layer, false);
+                LOG_DBG("Layer %d deactivated", target_layer);
+            }
         }
     }
-
-    k_mutex_unlock(&data->lock);
 }
 
 static K_WORK_DEFINE(layer_action_work, layer_action_work_cb);
@@ -160,16 +175,28 @@ static int handle_position_state_changed(const struct device *dev, const zmk_eve
     }
 
     const struct temp_layer_config *cfg = dev->config;
+    bool need_deactivate = false;
+    uint8_t target_layer = data->state.toggle_layer;
 
     if (data->state.is_active && cfg->excluded_positions && cfg->num_positions > 0) {
         if (!position_is_excluded(cfg, ev->position)) {
             LOG_DBG("Position not excluded, deactivating layer");
-            update_layer_state(&data->state, false);
+            data->state.is_active = false;
+            need_deactivate = true;
         }
     }
     LOG_DBG("Position excluded, continuing");
 
     k_mutex_unlock(&data->lock);
+
+    /* Effect the layer change outside the lock so the synchronous
+     * zmk_layer_state_changed fan-out (including this file's own L2
+     * handler) does not extend the lock-hold window observable by the
+     * input thread (L5).
+     */
+    if (need_deactivate) {
+        zmk_keymap_layer_deactivate(target_layer, false);
+    }
 
     return ZMK_EV_EVENT_BUBBLE;
 }
