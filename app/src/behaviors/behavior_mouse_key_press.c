@@ -44,7 +44,16 @@ static void process_key_state(const struct device *dev, int32_t val, bool presse
     for (int i = 0; i < ZMK_HID_MOUSE_NUM_BUTTONS; i++) {
         if (val & BIT(i)) {
             WRITE_BIT(val, i, 0);
-            input_report_key(dev, INPUT_BTN_0 + i, pressed ? 1 : 0, val == 0, K_FOREVER);
+            /* K_NO_WAIT: the binding callback may run on the kscan/event thread.
+             * Using K_FOREVER here can deadlock that thread if the input subsystem
+             * msgq is full (e.g. while the input thread is processing a slow
+             * event). Drop the report rather than freezing the keymap.
+             */
+            int err = input_report_key(dev, INPUT_BTN_0 + i, pressed ? 1 : 0, val == 0,
+                                       K_NO_WAIT);
+            if (err) {
+                LOG_WRN("Failed to report mouse key (err %d)", err);
+            }
         }
     }
 }
