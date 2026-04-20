@@ -74,14 +74,6 @@ endif # ZMK_SPLIT_ROLE_CENTRAL
 
 if !ZMK_SPLIT_ROLE_CENTRAL
 
-config ZMK_SPLIT_BLE_PERIPHERAL_STACK_SIZE
-    int "BLE split peripheral notify thread stack size"
-    default 756
-
-config ZMK_SPLIT_BLE_PERIPHERAL_PRIORITY
-    int "BLE split peripheral notify thread priority"
-    default 5
-
 config ZMK_SPLIT_BLE_PERIPHERAL_POSITION_QUEUE_SIZE
     int "Max number of key position state events to queue to send to the central"
     default 10
