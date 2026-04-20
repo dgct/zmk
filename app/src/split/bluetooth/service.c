@@ -341,50 +341,124 @@ bool zmk_split_bt_input_notify_ready(uint8_t reg) {
     return true;
 }
 
+void input_notify_work_cb(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(input_notify_work, input_notify_work_cb);
+
 static void input_notify_complete(struct bt_conn *conn, void *user_data) {
     atomic_clear(&input_notify_in_flight);
+    /* Wake the worker to drain the next queued entry, if any. */
+    k_work_schedule(&input_notify_work, K_NO_WAIT);
 }
 
 #define INPUT_NOTIFY_MAX_RETRIES 10
 
-static struct zmk_split_input_event_payload pending_input_payload;
-static const struct bt_gatt_attr *pending_input_attr;
-static int input_notify_retries;
+/* A single-slot 'pending_input_payload' was racy: a producer (input handler
+ * thread) can call zmk_split_bt_report_input twice within one input-event
+ * dispatch (e.g. a button release with sync=true triggers both the pass-through
+ * else-branch and the coalesce flush block in input_split.c). The worker on
+ * sysworkq cannot run between those two calls, so the second write overwrote
+ * the first and the first event was silently dropped.
+ *
+ * Use a small msgq, drop-oldest on overflow (matches sensor_state_msgq).
+ */
+struct input_notify_entry {
+    const struct bt_gatt_attr *attr;
+    struct zmk_split_input_event_payload payload;
+};
 
-void input_notify_work_cb(struct k_work *work);
-K_WORK_DELAYABLE_DEFINE(input_notify_work, input_notify_work_cb);
+#define INPUT_NOTIFY_QUEUE_DEPTH 16
+
+K_MSGQ_DEFINE(input_notify_msgq, sizeof(struct input_notify_entry), INPUT_NOTIFY_QUEUE_DEPTH, 4);
+
+/* Worker-private state: only touched from input_notify_work_cb (sysworkq). */
+static struct input_notify_entry current_entry;
+static bool current_entry_held; /* true when retrying current_entry on -ENOMEM */
+static int input_notify_retries;
 
 void input_notify_work_cb(struct k_work *work) {
     if (!zmk_split_bt_peripheral_is_connected()) {
+        struct input_notify_entry discard;
+        while (k_msgq_get(&input_notify_msgq, &discard, K_NO_WAIT) == 0) {
+        }
+        current_entry_held = false;
         input_notify_retries = 0;
         atomic_clear(&input_notify_in_flight);
         return;
     }
 
+    /* Wait for the previous notify's completion CB before sending the next one
+     * to preserve single-in-flight back-pressure. The CB will reschedule us.
+     * If the CB never fires, the stale-check in zmk_split_bt_input_notify_ready
+     * handles producer side; here we mirror that bound so the worker recovers
+     * even if no new producer call comes in.
+     */
+    if (atomic_get(&input_notify_in_flight)) {
+        uint32_t now = k_uptime_get_32();
+        uint32_t set = (uint32_t)atomic_get(&input_notify_in_flight_set_time);
+        uint32_t elapsed = now - set;
+        if (elapsed <= 500) {
+            return;
+        }
+        LOG_WRN("input notify completion stuck for %u ms, recovering", elapsed);
+        atomic_clear(&input_notify_in_flight);
+    }
+
+    /* Need an entry: either retry the held one (-ENOMEM backoff) or pull next. */
+    if (!current_entry_held) {
+        if (k_msgq_get(&input_notify_msgq, &current_entry, K_NO_WAIT) != 0) {
+            return; /* queue empty */
+        }
+        input_notify_retries = 0;
+    }
+
     struct bt_gatt_notify_params params = {
-        .attr = pending_input_attr,
-        .data = &pending_input_payload,
-        .len = sizeof(pending_input_payload),
+        .attr = current_entry.attr,
+        .data = &current_entry.payload,
+        .len = sizeof(current_entry.payload),
         .func = input_notify_complete,
     };
 
+    /* Set timestamp before in_flight so any reader observing in_flight=1 sees
+     * a valid timestamp.
+     */
+    atomic_set(&input_notify_in_flight_set_time, (atomic_val_t)k_uptime_get_32());
+    atomic_set(&input_notify_in_flight, 1);
+
     int err = bt_gatt_notify_cb(NULL, &params);
+    if (err == 0) {
+        /* The PDU has been buffered by the BLE stack (data is memcpy'd). The
+         * completion CB will fire later and reschedule us to drain the next.
+         */
+        current_entry_held = false;
+        input_notify_retries = 0;
+        return;
+    }
+
+    /* Roll back the in_flight set we did optimistically. */
+    atomic_clear(&input_notify_in_flight);
+
     if (err == -ENOMEM) {
         if (++input_notify_retries > INPUT_NOTIFY_MAX_RETRIES) {
-            LOG_WRN("ATT exhaustion: dropping input notify (%d retries)",
+            LOG_WRN("ATT exhaustion: dropping input notify after %d retries",
                     INPUT_NOTIFY_MAX_RETRIES);
+            current_entry_held = false;
             input_notify_retries = 0;
-            atomic_clear(&input_notify_in_flight);
+            /* Try to drain anything else queued behind it after a brief pause. */
+            k_work_schedule(&input_notify_work, K_MSEC(5));
             return;
         }
+        /* Hold current_entry and retry it after backoff. */
+        current_entry_held = true;
         k_work_schedule(&input_notify_work, K_MSEC(5));
         return;
     }
 
+    /* Other error (e.g. -ENOTCONN): drop current entry, try draining the rest. */
+    LOG_WRN("input notify err=%d, dropping entry", err);
+    current_entry_held = false;
     input_notify_retries = 0;
-    if (err) {
-        LOG_WRN("input notify work err=%d, clearing in_flight", err);
-        atomic_clear(&input_notify_in_flight);
+    if (k_msgq_num_used_get(&input_notify_msgq) > 0) {
+        k_work_schedule(&input_notify_work, K_NO_WAIT);
     }
 }
 
@@ -395,17 +469,22 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
         if (bt_uuid_cmp(split_svc.attrs[i].uuid,
                         BT_UUID_DECLARE_128(ZMK_SPLIT_BT_INPUT_EVENT_UUID)) == 0 &&
             (uint8_t)(uint32_t)split_svc.attrs[i + 2].user_data == reg) {
-            pending_input_payload = (struct zmk_split_input_event_payload){
-                .type = type,
-                .code = code,
-                .value = value,
-                .sync = sync ? 1 : 0,
+            struct input_notify_entry entry = {
+                .attr = &split_svc.attrs[i],
+                .payload = {
+                    .type = type,
+                    .code = code,
+                    .value = value,
+                    .sync = sync ? 1 : 0,
+                },
             };
-            pending_input_attr = &split_svc.attrs[i];
-
-            atomic_set(&input_notify_in_flight_set_time, (atomic_val_t)k_uptime_get_32());
-            atomic_set(&input_notify_in_flight, 1);
-            input_notify_retries = 0;
+            if (k_msgq_put(&input_notify_msgq, &entry, K_NO_WAIT) != 0) {
+                /* Queue full: drop the oldest pending entry and requeue. */
+                struct input_notify_entry discard;
+                k_msgq_get(&input_notify_msgq, &discard, K_NO_WAIT);
+                (void)k_msgq_put(&input_notify_msgq, &entry, K_NO_WAIT);
+                LOG_WRN("input notify queue full; dropped oldest");
+            }
             k_work_schedule(&input_notify_work, K_NO_WAIT);
             return 0;
         }
