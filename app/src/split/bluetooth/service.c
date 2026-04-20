@@ -210,32 +210,48 @@ BT_GATT_SERVICE_DEFINE(
                            split_svc_get_selected_phys_layout, split_svc_select_phys_layout,
                            NULL), );
 
-K_THREAD_STACK_DEFINE(service_q_stack, CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_STACK_SIZE);
-
-struct k_work_q service_work_q;
+#define POSITION_NOTIFY_MAX_RETRIES 5
+#define SENSOR_NOTIFY_MAX_RETRIES 5
 
 K_MSGQ_DEFINE(position_state_msgq, sizeof(char[POS_STATE_LEN]),
               CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_POSITION_QUEUE_SIZE, 4);
 
-void send_position_state_callback(struct k_work *work) {
+static int position_notify_retries;
+
+static void send_position_state_callback(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(service_position_notify_work, send_position_state_callback);
+
+static void send_position_state_callback(struct k_work *work) {
     uint8_t state[POS_STATE_LEN];
 
     if (!zmk_split_bt_peripheral_is_connected()) {
         k_msgq_purge(&position_state_msgq);
+        position_notify_retries = 0;
         return;
     }
-    while (k_msgq_get(&position_state_msgq, &state, K_NO_WAIT) == 0) {
+    while (k_msgq_peek(&position_state_msgq, &state) == 0) {
         int err = bt_gatt_notify(NULL, &split_svc.attrs[1], &state, sizeof(state));
+        if (err == -ENOMEM) {
+            if (++position_notify_retries > POSITION_NOTIFY_MAX_RETRIES) {
+                LOG_WRN("ATT exhaustion: dropping position notify after %d retries",
+                        POSITION_NOTIFY_MAX_RETRIES);
+                k_msgq_get(&position_state_msgq, &state, K_NO_WAIT);
+                position_notify_retries = 0;
+                continue;
+            }
+            k_work_schedule(&service_position_notify_work, K_MSEC(2));
+            return;
+        }
         if (err) {
             LOG_DBG("Error notifying %d", err);
         }
+        k_msgq_get(&position_state_msgq, &state, K_NO_WAIT);
+        position_notify_retries = 0;
     }
-};
-
-K_WORK_DEFINE(service_position_notify_work, send_position_state_callback);
+}
 
 int send_position_state() {
-    int err = k_msgq_put(&position_state_msgq, position_state, K_MSEC(100));
+    int err = k_msgq_put(&position_state_msgq, position_state, K_NO_WAIT);
     if (err) {
         switch (err) {
         case -EAGAIN: {
@@ -250,7 +266,7 @@ int send_position_state() {
         }
     }
 
-    k_work_submit(&service_position_notify_work);
+    k_work_schedule(&service_position_notify_work, K_NO_WAIT);
 
     return 0;
 }
@@ -269,20 +285,36 @@ static int zmk_split_bt_position_released(uint8_t position) {
 K_MSGQ_DEFINE(sensor_state_msgq, sizeof(struct sensor_event),
               CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_POSITION_QUEUE_SIZE, 4);
 
-void send_sensor_state_callback(struct k_work *work) {
-    while (k_msgq_get(&sensor_state_msgq, &last_sensor_event, K_NO_WAIT) == 0) {
+static int sensor_notify_retries;
+
+static void send_sensor_state_callback(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(service_sensor_notify_work, send_sensor_state_callback);
+
+static void send_sensor_state_callback(struct k_work *work) {
+    while (k_msgq_peek(&sensor_state_msgq, &last_sensor_event) == 0) {
         int err = bt_gatt_notify(NULL, &split_svc.attrs[8], &last_sensor_event,
                                  sizeof(last_sensor_event));
+        if (err == -ENOMEM) {
+            if (++sensor_notify_retries > SENSOR_NOTIFY_MAX_RETRIES) {
+                LOG_WRN("ATT exhaustion: dropping sensor notify after %d retries",
+                        SENSOR_NOTIFY_MAX_RETRIES);
+                k_msgq_get(&sensor_state_msgq, &last_sensor_event, K_NO_WAIT);
+                sensor_notify_retries = 0;
+                continue;
+            }
+            k_work_schedule(&service_sensor_notify_work, K_MSEC(2));
+            return;
+        }
         if (err) {
             LOG_DBG("Error notifying %d", err);
         }
+        k_msgq_get(&sensor_state_msgq, &last_sensor_event, K_NO_WAIT);
+        sensor_notify_retries = 0;
     }
-};
-
-K_WORK_DEFINE(service_sensor_notify_work, send_sensor_state_callback);
+}
 
 int send_sensor_state(struct sensor_event ev) {
-    int err = k_msgq_put(&sensor_state_msgq, &ev, K_MSEC(100));
+    int err = k_msgq_put(&sensor_state_msgq, &ev, K_NO_WAIT);
     if (err) {
         // retry...
         switch (err) {
@@ -298,7 +330,7 @@ int send_sensor_state(struct sensor_event ev) {
         }
     }
 
-    k_work_submit(&service_sensor_notify_work);
+    k_work_schedule(&service_sensor_notify_work, K_NO_WAIT);
     return 0;
 }
 
@@ -493,17 +525,6 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
 }
 
 #endif /* IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT) */
-
-static int service_init(void) {
-    static const struct k_work_queue_config queue_config = {
-        .name = "Split Peripheral Notification Queue"};
-    k_work_queue_start(&service_work_q, service_q_stack, K_THREAD_STACK_SIZEOF(service_q_stack),
-                       CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_PRIORITY, &queue_config);
-
-    return 0;
-}
-
-SYS_INIT(service_init, APPLICATION, CONFIG_ZMK_BLE_INIT_PRIORITY);
 
 int zmk_split_transport_peripheral_bt_report_event(
     const struct zmk_split_transport_peripheral_event *ev) {
