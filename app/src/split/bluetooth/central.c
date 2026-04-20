@@ -52,6 +52,7 @@ struct peripheral_slot {
     struct bt_gatt_subscribe_params sensor_subscribe_params;
     struct bt_gatt_discover_params sub_discover_params;
     uint16_t run_behavior_handle;
+    struct k_work_delayable conn_process_work;
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct bt_gatt_subscribe_params batt_lvl_subscribe_params;
     struct bt_gatt_read_params batt_lvl_read_params;
@@ -181,6 +182,8 @@ int release_peripheral_slot(int index) {
     }
 
     LOG_DBG("Releasing peripheral slot at %d", index);
+
+    k_work_cancel_delayable(&slot->conn_process_work);
 
     if (slot->conn != NULL) {
         bt_conn_unref(slot->conn);
@@ -745,16 +748,19 @@ static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
     return BT_GATT_ITER_STOP;
 }
 
-static void split_central_process_connection(struct bt_conn *conn) {
+static void split_central_process_connection_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct peripheral_slot *slot =
+        CONTAINER_OF(dwork, struct peripheral_slot, conn_process_work);
+
+    if (slot->state != PERIPHERAL_SLOT_STATE_CONNECTED || slot->conn == NULL) {
+        return;
+    }
+
+    struct bt_conn *conn = slot->conn;
     int err;
 
     LOG_DBG("Current security for connection: %d", bt_conn_get_security(conn));
-
-    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
-    if (slot == NULL) {
-        LOG_ERR("No peripheral state found for connection");
-        return;
-    }
 
     if (!slot->subscribe_params.value_handle) {
         slot->discover_params.uuid = &split_service_uuid.uuid;
@@ -764,7 +770,11 @@ static void split_central_process_connection(struct bt_conn *conn) {
         slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
 
         err = bt_gatt_discover(slot->conn, &slot->discover_params);
-        if (err) {
+        if (err == -ENOMEM) {
+            LOG_WRN("Discover ENOMEM, retrying");
+            k_work_schedule(&slot->conn_process_work, K_MSEC(5));
+            return;
+        } else if (err) {
             LOG_ERR("Discover failed(err %d)", err);
             return;
         }
@@ -944,7 +954,10 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
     LOG_DBG("Connected: %s", addr);
 
     confirm_peripheral_slot_conn(conn);
-    split_central_process_connection(conn);
+    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
+    if (slot != NULL) {
+        k_work_schedule(&slot->conn_process_work, K_NO_WAIT);
+    }
     k_work_submit(&notify_status_work);
 }
 
@@ -1160,6 +1173,11 @@ static struct settings_handler ble_central_settings_handler = {
 #endif // IS_ENABLED(CONFIG_SETTINGS)
 
 static int zmk_split_bt_central_init(void) {
+    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+        k_work_init_delayable(&peripherals[i].conn_process_work,
+                              split_central_process_connection_work_handler);
+    }
+
     bt_conn_cb_register(&conn_callbacks);
 
 #if IS_ENABLED(CONFIG_SETTINGS)
