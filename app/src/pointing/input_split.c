@@ -204,9 +204,11 @@ static void split_input_send_event(uint8_t reg, uint8_t type, uint16_t code, int
                 split_input_send_event(DT_INST_REG_ADDR(n), INPUT_EV_REL,                          \
                                        INPUT_REL_Y, cy, true);                                     \
             }                                                                                      \
-            acc_rel_x_##n = 0;                                                                     \
-            acc_rel_y_##n = 0;                                                                     \
-            acc_dirty_##n = false;                                                                 \
+            /* Preserve any residual motion CLAMP truncated (saturating flush). */                 \
+            /* In branches where we did not send an axis, cx/cy is 0, so this is a no-op. */       \
+            acc_rel_x_##n -= cx;                                                                   \
+            acc_rel_y_##n -= cy;                                                                   \
+            acc_dirty_##n = (acc_rel_x_##n != 0) || (acc_rel_y_##n != 0);                          \
         }                                                                                          \
     }                                                                                              \
     INPUT_CALLBACK_DEFINE(DEVICE_DT_GET(DT_INST_PHANDLE(n, device)), split_input_handler_##n, NULL);
