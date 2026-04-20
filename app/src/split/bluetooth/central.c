@@ -1009,11 +1009,6 @@ static struct bt_conn_cb conn_callbacks = {
     .security_changed = split_central_security_changed,
 };
 
-K_THREAD_STACK_DEFINE(split_central_split_run_q_stack,
-                      CONFIG_ZMK_SPLIT_BLE_CENTRAL_SPLIT_RUN_STACK_SIZE);
-
-struct k_work_q split_central_split_run_q;
-
 struct central_cmd_wrapper {
     uint8_t source;
     struct zmk_split_transport_central_command cmd;
@@ -1022,22 +1017,31 @@ struct central_cmd_wrapper {
 K_MSGQ_DEFINE(zmk_split_central_split_run_msgq, sizeof(struct central_cmd_wrapper),
               CONFIG_ZMK_SPLIT_BLE_CENTRAL_SPLIT_RUN_QUEUE_SIZE, 4);
 
-void split_central_split_run_callback(struct k_work *work) {
+#define SPLIT_RUN_MAX_RETRIES 5
+
+static int split_run_retries;
+
+static void split_central_split_run_callback(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(split_central_split_run_work, split_central_split_run_callback);
+
+static void split_central_split_run_callback(struct k_work *work) {
     struct central_cmd_wrapper payload_wrapper;
 
     LOG_DBG("");
 
-    while (k_msgq_get(&zmk_split_central_split_run_msgq, &payload_wrapper, K_NO_WAIT) == 0) {
+    while (k_msgq_peek(&zmk_split_central_split_run_msgq, &payload_wrapper) == 0) {
+        int err = 0;
+
         if (peripherals[payload_wrapper.source].state != PERIPHERAL_SLOT_STATE_CONNECTED) {
             LOG_ERR("Source not connected");
-            continue;
+            goto dequeue;
         }
 
         switch (payload_wrapper.cmd.type) {
         case ZMK_SPLIT_TRANSPORT_CENTRAL_CMD_TYPE_INVOKE_BEHAVIOR: {
             if (!peripherals[payload_wrapper.source].run_behavior_handle) {
                 LOG_ERR("Run behavior handle not found");
-                continue;
+                goto dequeue;
             }
 
             struct zmk_split_run_behavior_payload payload = {
@@ -1056,18 +1060,18 @@ void split_central_split_run_callback(struct k_work *work) {
                         payload.behavior_dev);
             }
 
-            int err = bt_gatt_write_without_response(
+            err = bt_gatt_write_without_response(
                 peripherals[payload_wrapper.source].conn,
                 peripherals[payload_wrapper.source].run_behavior_handle, &payload,
                 sizeof(struct zmk_split_run_behavior_payload), true);
 
-            if (err) {
+            if (err && err != -ENOMEM) {
                 LOG_ERR("Failed to write the behavior characteristic (err %d)", err);
             }
             break;
         }
         case ZMK_SPLIT_TRANSPORT_CENTRAL_CMD_TYPE_SET_PHYSICAL_LAYOUT:
-            update_peripheral_selected_layout(
+            err = update_peripheral_selected_layout(
                 &peripherals[payload_wrapper.source],
                 payload_wrapper.cmd.data.set_physical_layout.layout_idx);
             break;
@@ -1079,33 +1083,47 @@ void split_central_split_run_callback(struct k_work *work) {
                 // before the GATT characteristics have been discovered. If this is
                 // the case, the update_hid_indicators handle will not yet be set.
                 LOG_WRN("NO HANDLE TO SET ON PERIPHERAL");
-                break;
+                goto dequeue;
             }
 
-            int err = bt_gatt_write_without_response(
+            err = bt_gatt_write_without_response(
                 peripherals[payload_wrapper.source].conn,
                 peripherals[payload_wrapper.source].update_hid_indicators,
                 &payload_wrapper.cmd.data.set_hid_indicators.indicators,
                 sizeof(payload_wrapper.cmd.data.set_hid_indicators.indicators), true);
 
-            if (err) {
+            if (err && err != -ENOMEM) {
                 LOG_ERR("Failed to write HID indicator characteristic (err %d)", err);
             }
             break;
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
         default:
             LOG_WRN("Unsupported wrapped central command type %d", payload_wrapper.cmd.type);
+            goto dequeue;
+        }
+
+        if (err == -ENOMEM) {
+            if (++split_run_retries > SPLIT_RUN_MAX_RETRIES) {
+                LOG_WRN("ATT exhaustion: dropping split run queue after %d retries",
+                        SPLIT_RUN_MAX_RETRIES);
+                k_msgq_purge(&zmk_split_central_split_run_msgq);
+                split_run_retries = 0;
+                return;
+            }
+            k_work_schedule(&split_central_split_run_work, K_MSEC(2));
             return;
         }
+
+    dequeue:
+        k_msgq_get(&zmk_split_central_split_run_msgq, &payload_wrapper, K_NO_WAIT);
+        split_run_retries = 0;
     }
 }
-
-K_WORK_DEFINE(split_central_split_run_work, split_central_split_run_callback);
 
 static int split_bt_invoke_behavior_payload(struct central_cmd_wrapper payload_wrapper) {
     LOG_DBG("");
 
-    int err = k_msgq_put(&zmk_split_central_split_run_msgq, &payload_wrapper, K_MSEC(100));
+    int err = k_msgq_put(&zmk_split_central_split_run_msgq, &payload_wrapper, K_NO_WAIT);
     if (err) {
         switch (err) {
         case -EAGAIN: {
@@ -1120,7 +1138,7 @@ static int split_bt_invoke_behavior_payload(struct central_cmd_wrapper payload_w
         }
     }
 
-    k_work_submit_to_queue(&split_central_split_run_q, &split_central_split_run_work);
+    k_work_schedule(&split_central_split_run_work, K_NO_WAIT);
 
     return 0;
 };
@@ -1142,9 +1160,6 @@ static struct settings_handler ble_central_settings_handler = {
 #endif // IS_ENABLED(CONFIG_SETTINGS)
 
 static int zmk_split_bt_central_init(void) {
-    k_work_queue_start(&split_central_split_run_q, split_central_split_run_q_stack,
-                       K_THREAD_STACK_SIZEOF(split_central_split_run_q_stack),
-                       CONFIG_ZMK_BLE_THREAD_PRIORITY, NULL);
     bt_conn_cb_register(&conn_callbacks);
 
 #if IS_ENABLED(CONFIG_SETTINGS)
