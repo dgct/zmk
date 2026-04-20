@@ -99,6 +99,19 @@ config ZMK_INPUT_SPLIT_FLUSH_MS
       that motion arrives at the central before any subsequent click,
       preserving move-then-click ordering.
 
+config ZMK_INPUT_SPLIT_MAX_IN_FLIGHT
+    int "Max concurrent split-input notify operations"
+    default 4
+    range 1 8
+    help
+      How many bt_gatt_notify_cb calls may be in-flight (data handed to
+      the BLE host stack, awaiting HCI Number-Of-Completed-Packets).
+      Higher values decouple send rate from ~10 ms conn-event round-trip
+      latency at the cost of holding more ATT TX pool buffers
+      simultaneously. Should be <= CONFIG_BT_ATT_TX_COUNT / 2 so that
+      position/sensor/SMP notifies are not starved. 1 restores legacy
+      single-in-flight back-pressure (useful for bisecting regressions).
+
 endif # ZMK_INPUT_SPLIT
 
 endif # ZMK_POINTING

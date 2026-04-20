@@ -351,21 +351,32 @@ static int zmk_split_bt_sensor_triggered(uint8_t sensor_index,
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
-static atomic_t input_notify_in_flight = ATOMIC_INIT(0);
-/* 32-bit ms timestamp held in an atomic so reads and writes are tear-free on
- * 32-bit targets. k_uptime_get_32() wraps every ~49.7 days; unsigned
- * subtraction below is wraparound-safe for the 500 ms threshold.
+/* Counter of input notifies handed to the BLE host (bt_gatt_notify_cb returned
+ * 0) but not yet completed via the per-tx callback. Bounded by
+ * CONFIG_ZMK_INPUT_SPLIT_MAX_IN_FLIGHT. atomic_inc/atomic_dec are safe across
+ * the worker (sysworkq) and the completion CB (conn_tx_workq).
  */
-static atomic_t input_notify_in_flight_set_time = ATOMIC_INIT(0);
+static atomic_t input_notify_in_flight_count = ATOMIC_INIT(0);
+/* 32-bit ms timestamp of the OLDEST currently-in-flight notify. Set on the
+ * 0->1 transition only; the value remains valid as long as count >= 1 (the
+ * oldest hasn't completed). Cleared by the completion CB on the N->0
+ * transition. Used solely by the 500 ms stuck-recovery path. Tear-free on
+ * 32-bit targets via atomic_set/atomic_get. k_uptime_get_32() wraps every
+ * ~49.7 days; unsigned subtraction is wraparound-safe for the 500 ms window.
+ */
+static atomic_t input_notify_oldest_send_time = ATOMIC_INIT(0);
 
 bool zmk_split_bt_input_notify_ready(uint8_t reg) {
-    if (atomic_get(&input_notify_in_flight)) {
+    atomic_val_t count = atomic_get(&input_notify_in_flight_count);
+    if (count >= CONFIG_ZMK_INPUT_SPLIT_MAX_IN_FLIGHT) {
         uint32_t now = k_uptime_get_32();
-        uint32_t set = (uint32_t)atomic_get(&input_notify_in_flight_set_time);
-        uint32_t elapsed = now - set;
+        uint32_t oldest = (uint32_t)atomic_get(&input_notify_oldest_send_time);
+        uint32_t elapsed = now - oldest;
         if (elapsed > 500) {
-            LOG_WRN("input_notify_in_flight stuck for %u ms, auto-clearing", elapsed);
-            atomic_clear(&input_notify_in_flight);
+            LOG_WRN("input notify in-flight stuck (%d) for %u ms, resetting",
+                    (int)count, elapsed);
+            atomic_clear(&input_notify_in_flight_count);
+            atomic_set(&input_notify_oldest_send_time, 0);
             return true;
         }
         return false;
@@ -377,8 +388,18 @@ void input_notify_work_cb(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(input_notify_work, input_notify_work_cb);
 
 static void input_notify_complete(struct bt_conn *conn, void *user_data) {
-    atomic_clear(&input_notify_in_flight);
-    /* Wake the worker to drain the next queued entry, if any. */
+    /* atomic_dec returns the value BEFORE decrement (Zephyr API mirrors
+     * __atomic_fetch_sub). prev == 1 means new count is 0 — the last
+     * in-flight has completed and the oldest timestamp is no longer
+     * meaningful.
+     */
+    atomic_val_t prev = atomic_dec(&input_notify_in_flight_count);
+    if (prev == 1) {
+        atomic_set(&input_notify_oldest_send_time, 0);
+    }
+    /* Wake the worker to drain the next queued entry (and refill in-flight
+     * slots) now that one has freed up.
+     */
     k_work_schedule(&input_notify_work, K_NO_WAIT);
 }
 
@@ -414,83 +435,101 @@ void input_notify_work_cb(struct k_work *work) {
         }
         current_entry_held = false;
         input_notify_retries = 0;
-        atomic_clear(&input_notify_in_flight);
+        atomic_clear(&input_notify_in_flight_count);
+        atomic_set(&input_notify_oldest_send_time, 0);
         return;
     }
 
-    /* Wait for the previous notify's completion CB before sending the next one
-     * to preserve single-in-flight back-pressure. The CB will reschedule us.
-     * If the CB never fires, the stale-check in zmk_split_bt_input_notify_ready
-     * handles producer side; here we mirror that bound so the worker recovers
-     * even if no new producer call comes in.
+    /* Stuck-recovery: if all slots are taken and the oldest hasn't completed
+     * in 500 ms, the LL/peer is wedged. Reset the counter so we stop blocking
+     * on phantom in-flights. Mirrors the producer-side check in
+     * zmk_split_bt_input_notify_ready().
      */
-    if (atomic_get(&input_notify_in_flight)) {
+    if (atomic_get(&input_notify_in_flight_count) >=
+        CONFIG_ZMK_INPUT_SPLIT_MAX_IN_FLIGHT) {
         uint32_t now = k_uptime_get_32();
-        uint32_t set = (uint32_t)atomic_get(&input_notify_in_flight_set_time);
-        uint32_t elapsed = now - set;
+        uint32_t oldest = (uint32_t)atomic_get(&input_notify_oldest_send_time);
+        uint32_t elapsed = now - oldest;
         if (elapsed <= 500) {
-            return;
+            return; /* Wait for a completion CB to wake us. */
         }
-        LOG_WRN("input notify completion stuck for %u ms, recovering", elapsed);
-        atomic_clear(&input_notify_in_flight);
+        LOG_WRN("input notify in-flight stuck (%ld) for %u ms, recovering",
+                (long)atomic_get(&input_notify_in_flight_count), elapsed);
+        atomic_clear(&input_notify_in_flight_count);
+        atomic_set(&input_notify_oldest_send_time, 0);
     }
 
-    /* Need an entry: either retry the held one (-ENOMEM backoff) or pull next. */
-    if (!current_entry_held) {
-        if (k_msgq_get(&input_notify_msgq, &current_entry, K_NO_WAIT) != 0) {
-            return; /* queue empty */
-        }
-        input_notify_retries = 0;
-    }
-
-    struct bt_gatt_notify_params params = {
-        .attr = current_entry.attr,
-        .data = &current_entry.payload,
-        .len = sizeof(current_entry.payload),
-        .func = input_notify_complete,
-    };
-
-    /* Set timestamp before in_flight so any reader observing in_flight=1 sees
-     * a valid timestamp.
+    /* Drain the msgq up to MAX_IN_FLIGHT. Each bt_gatt_notify_cb call is
+     * non-blocking (~1 µs: build PDU, memcpy payload, k_fifo_put). Looping
+     * here is safe — no risk of starving sysworkq.
+     *
+     * The completion CB runs on conn_tx_workq (CONFIG_BT_CONN_TX_NOTIFY_WQ=y)
+     * and may decrement the counter concurrently with this loop. That's fine:
+     * atomic_get re-reads each iteration, so we naturally pick up freed slots.
      */
-    atomic_set(&input_notify_in_flight_set_time, (atomic_val_t)k_uptime_get_32());
-    atomic_set(&input_notify_in_flight, 1);
+    while (atomic_get(&input_notify_in_flight_count) <
+           CONFIG_ZMK_INPUT_SPLIT_MAX_IN_FLIGHT) {
+        if (!current_entry_held) {
+            if (k_msgq_get(&input_notify_msgq, &current_entry, K_NO_WAIT) != 0) {
+                return; /* Queue empty. */
+            }
+            input_notify_retries = 0;
+        }
 
-    int err = bt_gatt_notify_cb(NULL, &params);
-    if (err == 0) {
-        /* The PDU has been buffered by the BLE stack (data is memcpy'd). The
-         * completion CB will fire later and reschedule us to drain the next.
+        struct bt_gatt_notify_params params = {
+            .attr = current_entry.attr,
+            .data = &current_entry.payload,
+            .len = sizeof(current_entry.payload),
+            .func = input_notify_complete,
+        };
+
+        /* Optimistic increment BEFORE the send so a completion CB firing
+         * concurrently can't underflow. On 0->1, stamp the oldest-send-time
+         * for the stuck-detection window. On err, we roll the increment back.
          */
-        current_entry_held = false;
-        input_notify_retries = 0;
-        return;
-    }
+        if (atomic_get(&input_notify_in_flight_count) == 0) {
+            atomic_set(&input_notify_oldest_send_time,
+                       (atomic_val_t)k_uptime_get_32());
+        }
+        atomic_inc(&input_notify_in_flight_count);
 
-    /* Roll back the in_flight set we did optimistically. */
-    atomic_clear(&input_notify_in_flight);
-
-    if (err == -ENOMEM) {
-        if (++input_notify_retries > INPUT_NOTIFY_MAX_RETRIES) {
-            LOG_WRN("ATT exhaustion: dropping input notify after %d retries",
-                    INPUT_NOTIFY_MAX_RETRIES);
+        int err = bt_gatt_notify_cb(NULL, &params);
+        if (err == 0) {
+            /* Data has been memcpy'd into a net_buf from att_pool. The caller's
+             * current_entry buffer is free to reuse next iteration.
+             */
             current_entry_held = false;
             input_notify_retries = 0;
-            /* Try to drain anything else queued behind it after a brief pause. */
+            continue;
+        }
+
+        /* Roll back the optimistic increment. We don't unset the timestamp
+         * because other in-flights may still be active.
+         */
+        atomic_dec(&input_notify_in_flight_count);
+
+        if (err == -ENOMEM) {
+            /* ATT pool exhausted. Hold current_entry and back off — the next
+             * completion CB will reschedule us with at least one freed slot.
+             * The 5 ms timer is a safety net in case all CBs are also stalled.
+             */
+            if (++input_notify_retries > INPUT_NOTIFY_MAX_RETRIES) {
+                LOG_WRN("ATT exhaustion: dropping input notify after %d retries",
+                        INPUT_NOTIFY_MAX_RETRIES);
+                current_entry_held = false;
+                input_notify_retries = 0;
+                k_work_schedule(&input_notify_work, K_MSEC(5));
+                return;
+            }
+            current_entry_held = true;
             k_work_schedule(&input_notify_work, K_MSEC(5));
             return;
         }
-        /* Hold current_entry and retry it after backoff. */
-        current_entry_held = true;
-        k_work_schedule(&input_notify_work, K_MSEC(5));
-        return;
-    }
 
-    /* Other error (e.g. -ENOTCONN): drop current entry, try draining the rest. */
-    LOG_WRN("input notify err=%d, dropping entry", err);
-    current_entry_held = false;
-    input_notify_retries = 0;
-    if (k_msgq_num_used_get(&input_notify_msgq) > 0) {
-        k_work_schedule(&input_notify_work, K_NO_WAIT);
+        /* Other error (e.g. -ENOTCONN): drop this entry, try the next. */
+        LOG_WRN("input notify err=%d, dropping entry", err);
+        current_entry_held = false;
+        input_notify_retries = 0;
     }
 }
 
