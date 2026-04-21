@@ -6,6 +6,7 @@
 
 #include <zephyr/settings/settings.h>
 #include <zephyr/init.h>
+#include <zephyr/sys/atomic.h>
 
 #include <zephyr/logging/log.h>
 
@@ -302,8 +303,25 @@ BT_GATT_SERVICE_DEFINE(
 
 #define HOG_NOTIFY_MAX_RETRIES 10
 
+#if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+/* See item 8 plan in /memories/session/plan-constlat-hfclk-hog-pipeline.md
+ * Mirrors nRF Desktop hids.c HIDS_SUBSCRIBER_PIPELINE_SIZE + RMK
+ * hid_provider/mouse.rs motion-event synchronization. Mouse-only.
+ */
+static atomic_t mouse_in_flight;
+static struct zmk_hid_mouse_report_body mouse_coalesce;
+static bool mouse_coalesce_pending;
+static struct k_spinlock mouse_coalesce_lock;
+extern struct k_work_delayable hog_mouse_work;
+#endif
+
 static void hog_notify_complete(struct bt_conn *conn, void *user_data) {
     struct k_work_delayable *work = (struct k_work_delayable *)user_data;
+#if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+    if (work == &hog_mouse_work) {
+        atomic_dec(&mouse_in_flight);
+    }
+#endif
     k_work_reschedule(work, K_NO_WAIT);
 }
 
@@ -476,9 +494,46 @@ K_WORK_DELAYABLE_DEFINE(hog_mouse_work, send_mouse_report_callback);
 
 void send_mouse_report_callback(struct k_work *work) {
     struct zmk_hid_mouse_report_body report;
-    while (k_msgq_peek(&zmk_hog_mouse_msgq, &report) == 0) {
+    while (true) {
+#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+        /* Pipeline gate: don't dispatch more notifies than the configured
+         * window. Notify-completion callback re-triggers this worker. */
+        if (atomic_get(&mouse_in_flight) >= CONFIG_ZMK_HOG_MOUSE_PIPELINE_DEPTH) {
+            return;
+        }
+#endif
+
+        bool from_coalesce = false;
+        if (k_msgq_peek(&zmk_hog_mouse_msgq, &report) != 0) {
+#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+            /* Queue empty: flush any pending coalesced motion. */
+            k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+            if (!mouse_coalesce_pending) {
+                k_spin_unlock(&mouse_coalesce_lock, key);
+                return;
+            }
+            report = mouse_coalesce;
+            mouse_coalesce_pending = false;
+            k_spin_unlock(&mouse_coalesce_lock, key);
+            from_coalesce = true;
+#else
+            return;
+#endif
+        }
+
         struct bt_conn *conn = zmk_ble_active_profile_conn();
         if (conn == NULL) {
+#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+            if (from_coalesce) {
+                /* Restore the coalesced report so we don't lose it. */
+                k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+                if (!mouse_coalesce_pending) {
+                    mouse_coalesce = report;
+                    mouse_coalesce_pending = true;
+                }
+                k_spin_unlock(&mouse_coalesce_lock, key);
+            }
+#endif
             return;
         }
 
@@ -496,6 +551,16 @@ void send_mouse_report_callback(struct k_work *work) {
         // pipeline if we don't retry until the host completes subscription.
         if (err == -ENOMEM || err == -EINVAL) {
             bt_conn_unref(conn);
+#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+            if (from_coalesce) {
+                k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+                if (!mouse_coalesce_pending) {
+                    mouse_coalesce = report;
+                    mouse_coalesce_pending = true;
+                }
+                k_spin_unlock(&mouse_coalesce_lock, key);
+            }
+#endif
             if (++hog_mouse_retries > HOG_NOTIFY_MAX_RETRIES) {
                 LOG_WRN("Notify exhaustion: dropping mouse queue (err %d, %d retries)",
                         err, HOG_NOTIFY_MAX_RETRIES);
@@ -507,13 +572,19 @@ void send_mouse_report_callback(struct k_work *work) {
             return;
         }
 
-        k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT);
+        if (!from_coalesce) {
+            k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT);
+        }
         hog_mouse_retries = 0;
 
         if (err == -EPERM) {
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
             LOG_DBG("Error notifying %d", err);
+        } else {
+#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+            atomic_inc(&mouse_in_flight);
+#endif
         }
 
         bt_conn_unref(conn);
@@ -521,6 +592,32 @@ void send_mouse_report_callback(struct k_work *work) {
 };
 
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
+#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+    /* Pipeline saturated: merge into coalesce buffer instead of queueing.
+     * Sums motion/scroll deltas, latches buttons (last-value-wins).
+     * Mirrors RMK's hid_provider/mouse.rs accumulator pattern. */
+    if (atomic_get(&mouse_in_flight) >= CONFIG_ZMK_HOG_MOUSE_PIPELINE_DEPTH) {
+        k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+        if (mouse_coalesce_pending) {
+            int32_t x = (int32_t)mouse_coalesce.d_x + report->d_x;
+            int32_t y = (int32_t)mouse_coalesce.d_y + report->d_y;
+            int32_t sx = (int32_t)mouse_coalesce.d_scroll_x + report->d_scroll_x;
+            int32_t sy = (int32_t)mouse_coalesce.d_scroll_y + report->d_scroll_y;
+            mouse_coalesce.d_x = CLAMP(x, INT16_MIN, INT16_MAX);
+            mouse_coalesce.d_y = CLAMP(y, INT16_MIN, INT16_MAX);
+            mouse_coalesce.d_scroll_x = CLAMP(sx, INT16_MIN, INT16_MAX);
+            mouse_coalesce.d_scroll_y = CLAMP(sy, INT16_MIN, INT16_MAX);
+            mouse_coalesce.buttons = report->buttons;
+        } else {
+            mouse_coalesce = *report;
+            mouse_coalesce_pending = true;
+        }
+        k_spin_unlock(&mouse_coalesce_lock, key);
+        k_work_schedule(&hog_mouse_work, K_NO_WAIT);
+        return 0;
+    }
+#endif
+
     int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_NO_WAIT);
     if (err) {
         switch (err) {
