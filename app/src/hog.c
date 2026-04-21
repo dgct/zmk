@@ -366,6 +366,10 @@ int zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *report) {
     int err = k_msgq_put(&zmk_hog_keyboard_msgq, report, K_NO_WAIT);
     if (err) {
         switch (err) {
+        /* k_msgq_put() with K_NO_WAIT returns -ENOMSG when the queue is full;
+         * older code checked for -EAGAIN which never matched, causing reports
+         * to be silently dropped without rescheduling the drain work. */
+        case -ENOMSG:
         case -EAGAIN: {
             LOG_WRN("Keyboard message queue full, popping first message and queueing again");
             struct zmk_hid_keyboard_report_body discarded_report;
@@ -441,6 +445,8 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
     int err = k_msgq_put(&zmk_hog_consumer_msgq, report, K_NO_WAIT);
     if (err) {
         switch (err) {
+        /* k_msgq_put() with K_NO_WAIT returns -ENOMSG when the queue is full. */
+        case -ENOMSG:
         case -EAGAIN: {
             LOG_WRN("Consumer message queue full, popping first message and queueing again");
             struct zmk_hid_consumer_report_body discarded_report;
@@ -518,6 +524,8 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
     int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_NO_WAIT);
     if (err) {
         switch (err) {
+        /* k_msgq_put() with K_NO_WAIT returns -ENOMSG when the queue is full. */
+        case -ENOMSG:
         case -EAGAIN: {
             LOG_WRN("Mouse message queue full, popping first message and queueing again");
             struct zmk_hid_mouse_report_body discarded_report;
