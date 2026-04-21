@@ -36,7 +36,15 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 bool is_usb_power_present(void) {
 #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
-    return zmk_usb_is_powered();
+    /* Prefer the hardware VBUS bit to the USB-stack enumeration state.
+     * KVM switches drop the host's USB enumeration (-> usb_status goes
+     * to USB_DC_DISCONNECTED -> zmk_usb_is_powered() returns false)
+     * while VBUS stays asserted. Without this check, the keyboard would
+     * sys_poweroff() while connected to a KVM that's just temporarily
+     * routed away, then crash on re-enumeration when KVM switches back.
+     * On non-nRF or non-NRFX builds, zmk_usb_vbus_present() returns
+     * false and we fall back to the enumeration-state check. */
+    return zmk_usb_vbus_present() || zmk_usb_is_powered();
 #else
     return false;
 #endif /* IS_ENABLED(CONFIG_USB_DEVICE_STACK) */
