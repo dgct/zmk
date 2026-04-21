@@ -139,6 +139,16 @@ int peripheral_batt_lvl_listener(const zmk_event_t *eh) {
     LOG_DBG("Peripheral battery level event: %u", ev->state_of_charge);
 
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_PROXY_NOTIFY_THROTTLE)
+    /* Invalidate throttle state when we see a level=0 event. ZMK fires
+     * this on peripheral disconnect (see central.c split_central_disconnected)
+     * and real cells are typically cut off by voltage protection well
+     * before reaching 0%. Resetting `valid` here ensures the next real
+     * reading after reconnect bypasses the throttle and reaches the host
+     * immediately, regardless of how small the delta from 0 is. */
+    if (ev->state_of_charge == 0 && ev->source < CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS) {
+        proxy_throttle[ev->source].valid = false;
+    }
+
     if (proxy_should_throttle(ev->source, ev->state_of_charge)) {
         LOG_DBG("Throttling proxy notify for source %u at %u%%", ev->source,
                 ev->state_of_charge);

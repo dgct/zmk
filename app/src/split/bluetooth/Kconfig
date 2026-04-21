@@ -48,6 +48,18 @@ config ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_PROXY
       Adds support for reporting the battery levels of connected split
       peripherals through an additional Battery Level service.
 
+config ZMK_SPLIT_BLE_CENTRAL_BATTERY_NOTIFY_DISCONNECT
+    bool "Raise level=0 battery event on peripheral disconnect"
+    default y
+    help
+      Default-on preserves legacy ZMK behavior: when a peripheral
+      disconnects, the central fires a battery event with level=0 so
+      widgets/host show the peripheral as offline. Set n to suppress
+      the brief "0% then real value" flicker that hosts (e.g. macOS
+      menu bar) show on every transient reconnect; the central re-reads
+      the real value during service re-discovery within milliseconds
+      anyway.
+
 config ZMK_BATTERY_PROXY_NOTIFY_THROTTLE
     bool "Throttle peripheral battery proxy notifies"
     depends on ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_PROXY
