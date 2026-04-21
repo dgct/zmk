@@ -280,6 +280,17 @@ config ZMK_HOG_MOUSE_PIPELINE_DEPTH
       and lets two notifies overlap radio time without unbounded
       queue growth.
 
+config ZMK_HOG_RELEASE_ON_DISCONNECT
+    bool "Release HID state on HOG host BLE disconnect"
+    depends on ZMK_BLE
+    help
+      When the BLE link to the active host drops, clear pressed
+      keyboard/consumer/mouse state so reconnect doesn't replay
+      stuck modifiers, keys, or mouse buttons. Complements the
+      split-side input release in zmk_input_split_peripheral_disconnected
+      (cherry-pick of zmk#2721) which handles peripheral->central pointing.
+      This option handles the host-facing HOG link.
+
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
 
