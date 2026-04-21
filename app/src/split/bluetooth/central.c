@@ -38,6 +38,13 @@ static int start_scanning(void);
 
 #define POSITION_STATE_DATA_LEN 16
 
+/* Bug B: bound retries when bt_gatt_discover() fails on a freshly-connected
+ * peripheral (e.g. ATT bearer not ready -> -ENOTCONN). After exhaustion we
+ * disconnect so the standard reconnect/scan cycle gives us a clean slate.
+ * 10 retries * K_MSEC(5) = 50ms window before giving up.
+ */
+#define MAX_CONN_PROCESS_RETRIES 10
+
 enum peripheral_slot_state {
     PERIPHERAL_SLOT_STATE_OPEN,
     PERIPHERAL_SLOT_STATE_CONNECTING,
@@ -63,6 +70,8 @@ struct peripheral_slot {
     uint16_t selected_physical_layout_handle;
     uint8_t position_state[POSITION_STATE_DATA_LEN];
     uint8_t changed_positions[POSITION_STATE_DATA_LEN];
+    /* Bug B: bounded retry counter for split_central_process_connection_work_handler */
+    int conn_process_retries;
 #if IS_ENABLED(CONFIG_BT_GATT_NOTIFY_MULTIPLE)
     /* P2: Client Supported Features write — tells peripheral we accept
      * the ATT_HANDLE_VALUE_NTF_MULT (0x23) PDU so it can coalesce notifies.
@@ -228,6 +237,7 @@ int release_peripheral_slot(int index) {
     slot->subscribe_params.value_handle = 0;
     slot->run_behavior_handle = 0;
     slot->selected_physical_layout_handle = 0;
+    slot->conn_process_retries = 0;
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
     slot->update_hid_indicators = 0;
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
@@ -868,14 +878,25 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
         slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
 
         err = bt_gatt_discover(slot->conn, &slot->discover_params);
-        if (err == -ENOMEM) {
-            LOG_WRN("Discover ENOMEM, retrying");
+        if (err) {
+            // Bug B: previously only -ENOMEM was retried; any other error
+            // (e.g. -ENOTCONN if ATT bearer isn't ready yet) left the
+            // connection alive but unsubscribed forever, requiring a central
+            // reset to recover. Retry all errors with bounded budget; on
+            // exhaustion, disconnect so the standard reconnect path runs.
+            if (++slot->conn_process_retries > MAX_CONN_PROCESS_RETRIES) {
+                LOG_ERR("Discover failed after %d retries (err %d), disconnecting",
+                        MAX_CONN_PROCESS_RETRIES, err);
+                slot->conn_process_retries = 0;
+                bt_conn_disconnect(slot->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+                return;
+            }
+            LOG_WRN("Discover failed (err %d), retry %d/%d", err,
+                    slot->conn_process_retries, MAX_CONN_PROCESS_RETRIES);
             k_work_schedule(&slot->conn_process_work, K_MSEC(5));
             return;
-        } else if (err) {
-            LOG_ERR("Discover failed(err %d)", err);
-            return;
         }
+        slot->conn_process_retries = 0;
     }
 
     struct bt_conn_info info;
@@ -1019,6 +1040,9 @@ static int start_scanning(void) {
     is_scanning = true;
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
     if (err < 0) {
+        // Bug C: clear flag on failure or all future scans are blocked
+        // until reboot.
+        is_scanning = false;
         LOG_ERR("Scanning failed to start (err %d)", err);
         return err;
     }
