@@ -108,11 +108,12 @@ static int update_latency_only(struct bt_conn *conn, uint16_t new_latency) {
         return err;
     }
 
-    uint16_t interval_units = BT_GAP_US_TO_CONN_INTERVAL(info.le.interval_us);
-
+    /* info.le.interval is already in 1.25ms units — the same units that
+     * bt_le_conn_param expects for interval_min/max. No conversion needed.
+     */
     struct bt_le_conn_param param = {
-        .interval_min = interval_units,
-        .interval_max = interval_units,
+        .interval_min = info.le.interval,
+        .interval_max = info.le.interval,
         .latency = new_latency,
         .timeout = info.le.timeout,
     };
