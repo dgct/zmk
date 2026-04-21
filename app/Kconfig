@@ -57,6 +57,44 @@ config NRF_STORE_REBOOT_TYPE_GPREGRET
     bool
     default y
 
+config ZMK_CONSTLAT
+    bool "Request nRF52 constant-latency mode while active"
+    select NRFX_POWER
+    help
+      Mirrors nRF Desktop's constlat hotfix module
+      (applications/nrf_desktop/src/modules/constlat.c). Requests
+      CONSTLAT power mode so the regulators stay on, eliminating the
+      ~3-5 µs ramp jitter on every ISR entry. Reduces PS/2 bit-bang ISR
+      timeout retries and BLE TIFS jitter at the cost of ~2 mA
+      continuous current.
+
+config ZMK_CONSTLAT_DISABLE_ON_IDLE
+    bool "Free CONSTLAT mode when ZMK enters IDLE/SLEEP"
+    depends on ZMK_CONSTLAT
+    default y
+    help
+      Recovers the ~2 mA penalty during quiet periods. The mode is
+      re-requested on the next transition back to ACTIVE.
+
+config ZMK_HFCLK_LOCK
+    bool "Pre-lock the 64 MHz HFXO while active"
+    help
+      Mirrors nRF Desktop's hfclk_lock module
+      (applications/nrf_desktop/src/modules/hfclk_lock.c). Pre-acquires
+      the high-frequency crystal so the BLE controller does not pay the
+      ~360 µs HFXO ramp before the first conn event after wake. Pairs
+      with ZMK_BLE_DYNAMIC_HID_LATENCY: when slave latency snaps from
+      Idle-1 back to Active on the first input, the next conn event
+      finds HFXO already running.
+
+config ZMK_HFCLK_LOCK_DISABLE_ON_IDLE
+    bool "Release HFXO when ZMK enters IDLE/SLEEP"
+    depends on ZMK_HFCLK_LOCK
+    default y
+    help
+      Lets the BLE controller go back to its lazy on-demand request
+      pattern during quiet periods.
+
 endif # SOC_SERIES_NRF52X
 
 menu "HID"
@@ -219,6 +257,28 @@ config ZMK_BLE_CONSUMER_REPORT_QUEUE_SIZE
 config ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE
     int "Max number of mouse HID reports to queue for sending over BLE"
     default 20
+
+config ZMK_HOG_MOUSE_PIPELINE
+    bool "Limit in-flight HOG mouse notifies and coalesce overflow"
+    depends on ZMK_POINTING
+    help
+      Mirrors nRF Desktop's HIDS_SUBSCRIBER_PIPELINE_SIZE pattern
+      (applications/nrf_desktop/src/hids.c) and RMK's
+      hid_provider/mouse.rs motion-event synchronization. Caps the
+      number of mouse notifies in flight at any time; when the cap is
+      reached, additional reports are coalesced (motion/scroll deltas
+      summed, buttons latched) into a single pending report instead of
+      being dropped or overflowing the queue.
+
+config ZMK_HOG_MOUSE_PIPELINE_DEPTH
+    int "In-flight mouse notify cap"
+    depends on ZMK_HOG_MOUSE_PIPELINE
+    range 1 4
+    default 2
+    help
+      2 matches both nRF Desktop and our split central MAX_IN_FLIGHT
+      and lets two notifies overlap radio time without unbounded
+      queue growth.
 
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
