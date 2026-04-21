@@ -333,11 +333,14 @@ void send_keyboard_report_callback(struct k_work *work) {
         };
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
-        if (err == -ENOMEM) {
+        // -EINVAL: client not yet subscribed to this characteristic
+        // (BT_GATT_ENFORCE_SUBSCRIPTION). Retry like -ENOMEM so we don't
+        // silently drain the queue while the host is still subscribing.
+        if (err == -ENOMEM || err == -EINVAL) {
             bt_conn_unref(conn);
             if (++hog_keyboard_retries > HOG_NOTIFY_MAX_RETRIES) {
-                LOG_WRN("ATT exhaustion: dropping keyboard queue (%d retries)",
-                        HOG_NOTIFY_MAX_RETRIES);
+                LOG_WRN("Notify exhaustion: dropping keyboard queue (err %d, %d retries)",
+                        err, HOG_NOTIFY_MAX_RETRIES);
                 k_msgq_purge(&zmk_hog_keyboard_msgq);
                 hog_keyboard_retries = 0;
                 return;
@@ -406,11 +409,13 @@ void send_consumer_report_callback(struct k_work *work) {
         };
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
-        if (err == -ENOMEM) {
+        // -EINVAL: client not yet subscribed (BT_GATT_ENFORCE_SUBSCRIPTION).
+        // Retry like -ENOMEM.
+        if (err == -ENOMEM || err == -EINVAL) {
             bt_conn_unref(conn);
             if (++hog_consumer_retries > HOG_NOTIFY_MAX_RETRIES) {
-                LOG_WRN("ATT exhaustion: dropping consumer queue (%d retries)",
-                        HOG_NOTIFY_MAX_RETRIES);
+                LOG_WRN("Notify exhaustion: dropping consumer queue (err %d, %d retries)",
+                        err, HOG_NOTIFY_MAX_RETRIES);
                 k_msgq_purge(&zmk_hog_consumer_msgq);
                 hog_consumer_retries = 0;
                 return;
@@ -480,11 +485,14 @@ void send_mouse_report_callback(struct k_work *work) {
         };
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
-        if (err == -ENOMEM) {
+        // -EINVAL: client not yet subscribed (BT_GATT_ENFORCE_SUBSCRIPTION).
+        // At 80Hz TP, dropping reports here permanently kills the mouse
+        // pipeline if we don't retry until the host completes subscription.
+        if (err == -ENOMEM || err == -EINVAL) {
             bt_conn_unref(conn);
             if (++hog_mouse_retries > HOG_NOTIFY_MAX_RETRIES) {
-                LOG_WRN("ATT exhaustion: dropping mouse queue (%d retries)",
-                        HOG_NOTIFY_MAX_RETRIES);
+                LOG_WRN("Notify exhaustion: dropping mouse queue (err %d, %d retries)",
+                        err, HOG_NOTIFY_MAX_RETRIES);
                 k_msgq_purge(&zmk_hog_mouse_msgq);
                 hog_mouse_retries = 0;
                 return;
