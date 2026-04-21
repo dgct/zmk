@@ -19,6 +19,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/battery.h>
 #include <zmk/events/battery_state_changed.h>
 #include <zmk/events/activity_state_changed.h>
+#if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+#include <zmk/events/split_peripheral_status_changed.h>
+#endif
 #include <zmk/activity.h>
 #include <zmk/workqueue.h>
 
@@ -189,11 +192,32 @@ static int battery_event_listener(const zmk_event_t *eh) {
             break;
         }
     }
+#if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    {
+        const struct zmk_split_peripheral_status_changed *p_ev =
+            as_zmk_split_peripheral_status_changed(eh);
+        if (p_ev != NULL && p_ev->connected) {
+            /* Force an immediate battery sample on every central reconnect.
+             * Without this, the central sees the cached BAS value (often
+             * stale or zero post-boot) and waits up to one full
+             * CONFIG_ZMK_BATTERY_REPORT_INTERVAL (default 60s) for a fresh
+             * push. Submitting battery_work here re-runs the sensor read,
+             * updates last_state_of_charge, and triggers bt_bas_set
+             * (which fires the GATT notify the central is now subscribed
+             * to). Cheap: one extra ADC sample per reconnect. */
+            k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &battery_work);
+            return 0;
+        }
+    }
+#endif
     return -ENOTSUP;
 }
 
 ZMK_LISTENER(battery, battery_event_listener);
 
 ZMK_SUBSCRIPTION(battery, zmk_activity_state_changed);
+#if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+ZMK_SUBSCRIPTION(battery, zmk_split_peripheral_status_changed);
+#endif
 
 SYS_INIT(zmk_battery_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
