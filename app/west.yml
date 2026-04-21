@@ -10,7 +10,10 @@ manifest:
     - name: zephyr
       remote: dgct
       # v4.1.0+zmk-fixes + ls0xx VCOM sem/SPI release fix (display freeze)
-      revision: fba7337fd07f13891e858073c10a8926f8301c46
+      # + P8: [backport] BT_ATT_SENT_CB_AFTER_TX (true OTA-confirmed
+      # ATT TX completion callback, ~20 LOC across att.c/l2cap.c/conn.c/
+      # Kconfig.gatt; opt-in via CONFIG_BT_ATT_SENT_CB_AFTER_TX=y).
+      revision: bd0d065bde20fa0acaaf7a027bafb656b1084c00
       clone-depth: 1
       import:
         name-blocklist:
