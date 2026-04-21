@@ -16,6 +16,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zephyr/bluetooth/gatt.h>
 
 #include <zmk/ble.h>
+#include <zmk/endpoints.h>
 #include <zmk/endpoints_types.h>
 #include <zmk/hog.h>
 #include <zmk/hid.h>
@@ -640,5 +641,56 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
     return 0;
 };
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
+
+#if IS_ENABLED(CONFIG_ZMK_HOG_RELEASE_ON_DISCONNECT)
+
+/* Release HID state when a HOG host disconnects so reconnect doesn't carry
+ * over stuck modifiers/keys/buttons. Pairs with the split-side
+ * zmk_input_split_peripheral_disconnected() that releases pointing input
+ * forwarded from peripherals (cherry-pick of zmk#2721). This handles the
+ * complementary case: the host-facing HOG link dropping while keys are held.
+ *
+ * If a mouse pipeline is configured, also drains the coalesce buffer and
+ * resets in-flight counters so a stale pending report can't ride a fresh
+ * connection.
+ */
+static void hog_host_disconnected(struct bt_conn *conn, uint8_t reason) {
+    struct bt_conn_info info;
+    if (bt_conn_get_info(conn, &info) != 0) {
+        return;
+    }
+    /* HOG runs in the peripheral role (the keyboard advertises to a host).
+     * Ignore central-role disconnects (split peripheral link) — those have
+     * their own cleanup path in app/src/split/bluetooth/central.c. */
+    if (info.role != BT_HCI_ROLE_PERIPHERAL) {
+        return;
+    }
+
+    LOG_INF("HOG host disconnect (reason 0x%02x), clearing HID state", reason);
+
+#if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+    {
+        k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+        mouse_coalesce = (struct zmk_hid_mouse_report_body){0};
+        mouse_coalesce_pending = false;
+        k_spin_unlock(&mouse_coalesce_lock, key);
+    }
+    atomic_set(&mouse_in_flight, 0);
+#endif
+
+    /* Only clear the global HID register state if the dropped connection
+     * was the active profile's link. Other (background) profile links
+     * dropping must not wipe state shared with the active host. */
+    bt_addr_le_t *active_addr = zmk_ble_active_profile_addr();
+    if (active_addr != NULL && bt_addr_le_eq(&info.le.dst, active_addr)) {
+        zmk_endpoint_clear_reports();
+    }
+}
+
+BT_CONN_CB_DEFINE(hog_conn_callbacks) = {
+    .disconnected = hog_host_disconnected,
+};
+
+#endif // IS_ENABLED(CONFIG_ZMK_HOG_RELEASE_ON_DISCONNECT)
 
 
