@@ -10,6 +10,10 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/usb/class/usb_hid.h>
 
+#if defined(CONFIG_SOC_FAMILY_NORDIC_NRF) && defined(CONFIG_USB_NRFX)
+#include <hal/nrf_power.h>
+#endif
+
 #include <zmk/hid.h>
 #include <zmk/keymap.h>
 #include <zmk/event_manager.h>
@@ -30,6 +34,19 @@ static void raise_usb_status_changed_event(struct k_work *_work) {
 K_WORK_DEFINE(usb_status_notifier_work, raise_usb_status_changed_event);
 
 enum usb_dc_status_code zmk_usb_get_status(void) { return usb_status; }
+
+bool zmk_usb_vbus_present(void) {
+#if defined(CONFIG_SOC_FAMILY_NORDIC_NRF) && defined(CONFIG_USB_NRFX)
+    /* Hardware VBUS detect, independent of USB enumeration state.
+     * Stays true through KVM switches that drop host enumeration but
+     * keep VBUS asserted on the device-side cable. Used by activity.c
+     * to keep the keyboard awake whenever VBUS is hot, preventing
+     * sys_poweroff() while a host might re-enumerate. */
+    return nrf_power_usbregstatus_vbusdet_get(NRF_POWER);
+#else
+    return false;
+#endif
+}
 
 enum zmk_usb_conn_state zmk_usb_get_conn_state(void) {
     LOG_DBG("state: %d", usb_status);
