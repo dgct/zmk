@@ -247,6 +247,53 @@ config BT_PERIPHERAL_PREF_TIMEOUT
 config BT_DEVICE_NAME_MAX
     default 16
 
+config ZMK_BLE_DYNAMIC_HID_LATENCY
+    bool "Dynamically raise host-link slave latency during quiet periods"
+    help
+      Mirrors nRF Desktop's `ble_latency.c` pattern. Keeps
+      BT_PERIPHERAL_PREF_LATENCY=0 during HID activity so the host (e.g.
+      macOS) cannot skip ACK windows (Bug 6 fix), but raises the slave
+      latency after a configurable idle period so the radio can sleep.
+      Two idle tiers are driven by ZMK activity-state: a short "Idle-1"
+      after `ZMK_BLE_HID_IDLE_TIMEOUT_MS` of HID silence, and a deeper
+      "Idle-2" when ZMK enters its IDLE state (CONFIG_ZMK_IDLE_TIMEOUT).
+
+if ZMK_BLE_DYNAMIC_HID_LATENCY
+
+config ZMK_BLE_HID_IDLE_TIMEOUT_MS
+    int "HID-silence window before raising latency to Idle-1 (ms)"
+    default 5000
+    help
+      Matches nRF Desktop's LOW_LATENCY_CHECK_PERIOD_MS empirical default.
+
+config ZMK_BLE_HID_IDLE_LATENCY_INTERVALS
+    int "Slave latency in connection intervals for Idle-1 tier"
+    default 30
+    help
+      With CI=7.5ms and latency=30 the effective wake interval is ~232ms.
+      Equivalent to BT_PERIPHERAL_PREF_LATENCY's historical default.
+
+config ZMK_BLE_DEEP_IDLE_INTERVAL_MS
+    int "Connection interval for Idle-2 tier (ms)"
+    default 20
+    help
+      RMK's empirical "sleep+host" tier (rmk/src/split/ble/central.rs).
+      Combined with DEEP_IDLE_LATENCY_INTERVALS=200 this gives a ~4s
+      effective wake cadence on the host link during ZMK IDLE.
+
+config ZMK_BLE_DEEP_IDLE_LATENCY_INTERVALS
+    int "Slave latency in connection intervals for Idle-2 tier"
+    default 200
+
+config ZMK_BLE_DEEP_IDLE_TIMEOUT_S
+    int "Supervision timeout for Idle-2 tier (seconds)"
+    default 9
+    help
+      Must be longer than DEEP_IDLE_INTERVAL_MS * (1 + LATENCY) to survive
+      a single missed window. RMK uses 9s with 20ms*200.
+
+endif # ZMK_BLE_DYNAMIC_HID_LATENCY
+
 endif # ZMK_BLE
 
 endmenu # Output Types
