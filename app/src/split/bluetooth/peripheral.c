@@ -76,8 +76,12 @@ static bool low_duty_advertising = false;
 static bool enabled = false;
 
 static void advertising_cb(struct k_work *work) {
-    // Stop any stale advertising (e.g. from ble.c) before starting split advertising.
-    bt_le_adv_stop();
+    // NOTE: Do NOT call bt_le_adv_stop() here. Stopping a directed-advertising
+    // session frees its associated bt_conn slot, which immediately triggers the
+    // recycled() callback below, which resubmits this work — producing a tight
+    // infinite loop that starves sysworkq (kscan/PS2/HOG all hang). ble.c is
+    // already guarded out on split peripherals, so there is no other advertiser
+    // to stop here.
     const int err = start_advertising(low_duty_advertising);
     if (err < 0) {
         LOG_ERR("Failed to start advertising (%d)", err);
