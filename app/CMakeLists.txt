@@ -85,6 +85,7 @@ if ((NOT CONFIG_ZMK_SPLIT) OR CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
     target_sources(app PRIVATE src/behaviors/behavior_bt.c)
     target_sources(app PRIVATE src/ble.c)
     target_sources(app PRIVATE src/hog.c)
+    target_sources_ifdef(CONFIG_ZMK_BLE_DYNAMIC_HID_LATENCY app PRIVATE src/ble_latency.c)
   endif()
 endif()
 
