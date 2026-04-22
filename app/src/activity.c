@@ -100,16 +100,12 @@ void activity_work_handler(struct k_work *work) {
         // Put devices in suspend power mode before sleeping
         set_state(ZMK_ACTIVITY_SLEEP);
 
-        if (zmk_pm_suspend_devices() < 0) {
-            // Best-effort: log the failure but proceed to sys_poweroff()
-            // anyway. SYSTEM_OFF destroys all state regardless, so a
-            // failed device suspend must not prevent us from reaching
-            // the low-power state — otherwise the CPU spins in a retry
-            // loop at full power, draining the battery overnight.
-            // (Upstream regression: zmkfirmware/zmk#3207, introduced by
-            // the Zephyr 4.1 migration removing pm_device_state_is_locked.)
-            LOG_WRN("Device suspend failed; proceeding to poweroff");
-        }
+        // Disable all wakeup sources, suspend all devices, then
+        // re-enable only the designated wakeup sources (e.g. kscan)
+        // so GPIO SENSE wake works correctly from SYSTEMOFF.
+        zmk_pm_prepare_for_poweroff();
+
+        zmk_pm_suspend_devices();
 
         sys_poweroff();
     } else
