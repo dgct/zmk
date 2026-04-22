@@ -1321,6 +1321,48 @@ static int zmk_split_bt_central_init(void) {
 
 SYS_INIT(zmk_split_bt_central_init, APPLICATION, CONFIG_ZMK_BLE_INIT_PRIORITY);
 
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_IDLE_CONN_PARAMS)
+
+static void split_central_set_idle_conn_params(void) {
+    struct bt_le_conn_param param = {
+        .interval_min = CONFIG_ZMK_SPLIT_BLE_IDLE_CI,
+        .interval_max = CONFIG_ZMK_SPLIT_BLE_IDLE_CI,
+        .latency = CONFIG_ZMK_SPLIT_BLE_IDLE_LATENCY,
+        .timeout = CONFIG_ZMK_SPLIT_BLE_IDLE_TIMEOUT,
+    };
+
+    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+        if (peripherals[i].state != PERIPHERAL_SLOT_STATE_CONNECTED || !peripherals[i].conn) {
+            continue;
+        }
+        int err = bt_conn_le_param_update(peripherals[i].conn, &param);
+        if (err && err != -EALREADY) {
+            LOG_WRN("Failed to widen split CI for peripheral %d (%d)", i, err);
+        }
+    }
+}
+
+static void split_central_restore_fast_conn_params(void) {
+    struct bt_le_conn_param param = {
+        .interval_min = CONFIG_ZMK_SPLIT_BLE_PREF_INT,
+        .interval_max = CONFIG_ZMK_SPLIT_BLE_PREF_INT,
+        .latency = CONFIG_ZMK_SPLIT_BLE_PREF_LATENCY,
+        .timeout = CONFIG_ZMK_SPLIT_BLE_PREF_TIMEOUT,
+    };
+
+    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+        if (peripherals[i].state != PERIPHERAL_SLOT_STATE_CONNECTED || !peripherals[i].conn) {
+            continue;
+        }
+        int err = bt_conn_le_param_update(peripherals[i].conn, &param);
+        if (err && err != -EALREADY) {
+            LOG_WRN("Failed to restore split CI for peripheral %d (%d)", i, err);
+        }
+    }
+}
+
+#endif /* CONFIG_ZMK_SPLIT_BLE_IDLE_CONN_PARAMS */
+
 static int zmk_split_bt_central_listener_cb(const zmk_event_t *eh) {
     if (as_zmk_physical_layout_selection_changed(eh)) {
         k_work_submit(&update_peripherals_selected_layouts_work);
@@ -1328,9 +1370,21 @@ static int zmk_split_bt_central_listener_cb(const zmk_event_t *eh) {
 
     const struct zmk_activity_state_changed *activity_ev = as_zmk_activity_state_changed(eh);
     if (activity_ev) {
-        if (activity_ev->state == ZMK_ACTIVITY_SLEEP) {
+        switch (activity_ev->state) {
+        case ZMK_ACTIVITY_ACTIVE:
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_IDLE_CONN_PARAMS)
+            split_central_restore_fast_conn_params();
+#endif
+            break;
+        case ZMK_ACTIVITY_IDLE:
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_IDLE_CONN_PARAMS)
+            split_central_set_idle_conn_params();
+#endif
+            break;
+        case ZMK_ACTIVITY_SLEEP:
             LOG_DBG("Sleep state detected, disabling BLE central");
             split_central_bt_set_enabled(false);
+            break;
         }
     }
 
