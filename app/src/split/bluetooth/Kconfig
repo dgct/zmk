@@ -120,6 +120,35 @@ config ZMK_SPLIT_BLE_PREF_TIMEOUT
     int "Supervision timeout to use for split central/peripheral connection"
     default 400
 
+config ZMK_SPLIT_BLE_IDLE_CONN_PARAMS
+    bool "Widen split connection params during ZMK idle to save power"
+    default y if ZMK_BLE_DYNAMIC_HID_LATENCY
+    help
+      When ZMK enters its idle state, widen the split central-peripheral
+      link (CI, latency, timeout) to reduce radio wake-ups on both halves.
+      Restored to fast params on first keypress. RMK validated pattern.
+
+if ZMK_SPLIT_BLE_IDLE_CONN_PARAMS
+
+config ZMK_SPLIT_BLE_IDLE_CI
+    int "Split CI during ZMK idle (1.25ms units)"
+    default 16
+    help
+      16 = 20ms. Combined with IDLE_LATENCY=200, gives ~4s effective
+      wake cadence. RMK uses 20ms for connected-to-host idle.
+
+config ZMK_SPLIT_BLE_IDLE_LATENCY
+    int "Split slave latency during ZMK idle"
+    default 200
+
+config ZMK_SPLIT_BLE_IDLE_TIMEOUT
+    int "Split supervision timeout during ZMK idle (10ms units)"
+    default 900
+    help
+      900 = 9s. Must be > (1+latency)*CI*2 = (201*20ms*2) = 8040ms.
+
+endif # ZMK_SPLIT_BLE_IDLE_CONN_PARAMS
+
 endif # ZMK_SPLIT_ROLE_CENTRAL
 
 if !ZMK_SPLIT_ROLE_CENTRAL

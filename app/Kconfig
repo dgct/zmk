@@ -363,6 +363,23 @@ config ZMK_BLE_DEEP_IDLE_TIMEOUT_S
       Must be longer than DEEP_IDLE_INTERVAL_MS * (1 + LATENCY) to survive
       a single missed window. RMK uses 9s with 20ms*200.
 
+config ZMK_BLE_CONN_PARAM_WARMUP_MS
+    int "Apple two-phase warmup: delay before tightening to fast CI (ms)"
+    default 5000
+    help
+      Apple (macOS/iOS) rejects the first L2CAP conn param update if the
+      requested interval is < 15ms. This enables a two-phase approach per
+      the Apple Accessory Design Guidelines and RMK's validated pattern:
+      connect at 15ms (BT_PERIPHERAL_PREF_MIN_INT=12), then tighten to
+      the fast CI after this delay. Set to 0 to disable.
+
+config ZMK_BLE_FAST_CI_INTERVAL
+    int "Target fast connection interval after warmup (1.25ms units)"
+    default 6
+    help
+      6 = 7.5ms (BLE HID recommended floor). Requested after the warmup
+      delay expires. Also used to restore CI when exiting deep idle.
+
 endif # ZMK_BLE_DYNAMIC_HID_LATENCY
 
 endif # ZMK_BLE

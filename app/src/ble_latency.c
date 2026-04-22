@@ -11,6 +11,8 @@
  * latency during quiet periods to recover the radio battery cost.
  *
  * Tiers:
+ *   Warmup: CI=15ms (from PREF params), tighten to 7.5ms after
+ *           CONFIG_ZMK_BLE_CONN_PARAM_WARMUP_MS (Apple two-phase dance)
  *   Active : latency=0,                                     CI preserved
  *   Idle-1 : latency=CONFIG_ZMK_BLE_HID_IDLE_LATENCY_INTERVALS
  *            (after CONFIG_ZMK_BLE_HID_IDLE_TIMEOUT_MS of HID silence),
@@ -63,12 +65,14 @@ enum {
     CONN_IS_SECURED = BIT(2),
     CONN_IN_DEEP_IDLE = BIT(3),
     CONN_UPDATE_PENDING = BIT(4),
+    CONN_WARMUP_DONE = BIT(5),
 };
 
 static struct bt_conn *active_conn;
 static uint8_t latency_state;
 static struct k_spinlock state_lock;
 static struct k_work_delayable idle_check_work;
+static struct k_work_delayable warmup_work;
 
 struct snapshot {
     struct bt_conn *conn;
@@ -139,7 +143,30 @@ static void request_low_latency(void) {
         k_work_reschedule(&idle_check_work, IDLE_TIMEOUT_MS);
         return;
     }
-    int err = update_latency_only(s.conn, 0);
+
+    /* If CI was widened by deep idle and warmup has completed, restore
+     * the fast CI alongside the latency change. Without this, deep idle
+     * recovery would leave CI at 20ms with only latency=0.
+     */
+    struct bt_conn_info info;
+    if (bt_conn_get_info(s.conn, &info)) {
+        return;
+    }
+
+    int err;
+    if ((s.state & CONN_WARMUP_DONE) &&
+        info.le.interval > CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+        struct bt_le_conn_param param = {
+            .interval_min = CONFIG_ZMK_BLE_FAST_CI_INTERVAL,
+            .interval_max = CONFIG_ZMK_BLE_FAST_CI_INTERVAL,
+            .latency = 0,
+            .timeout = info.le.timeout,
+        };
+        err = bt_conn_le_param_update(s.conn, &param);
+    } else {
+        err = update_latency_only(s.conn, 0);
+    }
+
     if (err == 0) {
         state_set_bit(CONN_UPDATE_PENDING);
     }
@@ -195,6 +222,53 @@ static void idle_check_fn(struct k_work *work) {
     request_idle_1();
 }
 
+/* Apple two-phase conn param dance (Apple Accessory Design Guidelines +
+ * RMK pattern): the host initially connects at 15ms CI (from
+ * BT_PERIPHERAL_PREF_MIN_INT=12). After a warmup delay, we request the
+ * fast CI (7.5ms). Apple rejects < 15ms on the first L2CAP conn param
+ * update but accepts it once the link is established.
+ */
+static void warmup_fn(struct k_work *work) {
+    ARG_UNUSED(work);
+    struct snapshot s = take_snapshot();
+    if (!s.conn || !(s.state & CONN_IS_SECURED) || (s.state & CONN_WARMUP_DONE)) {
+        return;
+    }
+
+    struct bt_conn_info info;
+    if (bt_conn_get_info(s.conn, &info)) {
+        return;
+    }
+
+    if (info.le.interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+        /* Host already chose a fast CI (e.g. Windows/Linux) — skip. */
+        state_set_bit(CONN_WARMUP_DONE);
+        return;
+    }
+
+    if (s.state & CONN_UPDATE_PENDING) {
+        /* A latency update is in flight — retry after it settles. */
+        k_work_reschedule(&warmup_work, K_MSEC(500));
+        return;
+    }
+
+    struct bt_le_conn_param param = {
+        .interval_min = CONFIG_ZMK_BLE_FAST_CI_INTERVAL,
+        .interval_max = CONFIG_ZMK_BLE_FAST_CI_INTERVAL,
+        .latency = info.le.latency,
+        .timeout = info.le.timeout,
+    };
+
+    int err = bt_conn_le_param_update(s.conn, &param);
+    if (err == 0) {
+        state_set_bit(CONN_UPDATE_PENDING);
+    } else if (err == -EALREADY) {
+        k_work_reschedule(&warmup_work, K_MSEC(500));
+    } else {
+        LOG_WRN("ble_latency: warmup CI tighten failed (%d)", err);
+    }
+}
+
 static void on_connected(struct bt_conn *conn, uint8_t err) {
     struct bt_conn_info info;
     if (err || bt_conn_get_info(conn, &info) != 0) {
@@ -224,6 +298,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
     k_spin_unlock(&state_lock, key);
     if (was_active) {
         k_work_cancel_delayable(&idle_check_work);
+        k_work_cancel_delayable(&warmup_work);
     }
 }
 
@@ -238,17 +313,25 @@ static void on_security_changed(struct bt_conn *conn, bt_security_t level,
     k_spin_unlock(&state_lock, key);
     if (armed) {
         k_work_reschedule(&idle_check_work, IDLE_TIMEOUT_MS);
+        if (CONFIG_ZMK_BLE_CONN_PARAM_WARMUP_MS > 0) {
+            k_work_reschedule(&warmup_work,
+                              K_MSEC(CONFIG_ZMK_BLE_CONN_PARAM_WARMUP_MS));
+        } else {
+            state_set_bit(CONN_WARMUP_DONE);
+        }
     }
 }
 
 static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency,
                                 uint16_t timeout) {
-    ARG_UNUSED(interval);
     ARG_UNUSED(timeout);
     bool restore = false;
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     if (conn == active_conn) {
         latency_state &= ~CONN_UPDATE_PENDING;
+        if (interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+            latency_state |= CONN_WARMUP_DONE;
+        }
         if (latency == 0) {
             latency_state |= CONN_LOW_LATENCY_ENABLED;
         } else {
@@ -326,6 +409,7 @@ INPUT_CALLBACK_DEFINE(NULL, ble_latency_input_listener, NULL);
 
 static int ble_latency_init(void) {
     k_work_init_delayable(&idle_check_work, idle_check_fn);
+    k_work_init_delayable(&warmup_work, warmup_fn);
     return 0;
 }
 
