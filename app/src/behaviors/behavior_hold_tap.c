@@ -532,7 +532,7 @@ static void decide_positional_hold(struct active_hold_tap *hold_tap) {
 
     // Pressed key is not included in positions.
     // We act on press?
-    if (undecided_hold_tap->config->hold_trigger_on_release == false) {
+    if (hold_tap->config->hold_trigger_on_release == false) {
         hold_tap->status = STATUS_TAP;
         return; // ignore flavor, set TAP
     }
@@ -540,21 +540,18 @@ static void decide_positional_hold(struct active_hold_tap *hold_tap) {
     // We act on release.
     // Released key is not set?
     if (hold_tap->position_of_first_other_key_released == -1) {
-        // Is current decision hold based on key pressed?
-        if (hold_tap->status == STATUS_HOLD_INTERRUPT) {
-            // We cannot decide yet if key which will be released:
-            // - not in positions
-            // - be released before timer
-            // So we cannot decide yet if we should overwrite decision to TAP.
-            // We have to wait for key release.
+        // A non-trigger key was pressed but not yet released.
+        // Both interrupt and timer decisions must be deferred until
+        // the release arrives so we can check the released position.
+        // Without this, STATUS_HOLD_TIMER leaks through and fires the
+        // modifier — the original code unconditionally set TAP here.
+        if (hold_tap->status == STATUS_HOLD_INTERRUPT ||
+            hold_tap->status == STATUS_HOLD_TIMER) {
             hold_tap->status = STATUS_UNDECIDED;
-            return; // remove flavor
+            return; // defer decision until key release
         }
 
-        // The decision is the decision:
-        // - STATUS_HOLD_TIMER - tapping term reached, apply flavor
-        // - STATUS_TAP - even if we set TAP later it will not change decision
-        return; // apply flavor
+        return; // STATUS_TAP — already decided, nothing to override
     }
 
     // Released key is included in positions?
