@@ -22,6 +22,12 @@ config INPUT_GPIO_KEYS
 config INPUT_THREAD_STACK_SIZE
     default 1024 if ZMK_SPLIT && !ZMK_SPLIT_ROLE_CENTRAL
 
+# On split peripherals the input thread only forwards data over the split
+# transport (BLE). It must not preempt BLE host processing (BT_RX_PRIO=8),
+# otherwise keyboard HID reports queue up and arrive in bursts (typing lag).
+config INPUT_THREAD_PRIORITY
+    default 9 if ZMK_SPLIT && !ZMK_SPLIT_ROLE_CENTRAL
+
 if !ZMK_SPLIT || ZMK_SPLIT_ROLE_CENTRAL
 
 config ZMK_POINTING_SMOOTH_SCROLLING
