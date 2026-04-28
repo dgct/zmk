@@ -54,18 +54,34 @@ static uint8_t lithium_ion_mv_to_pct(int16_t bat_mv) {
 #endif // IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING_FETCH_MODE_LITHIUM_VOLTAGE)
 
 #if IS_ENABLED(CONFIG_BT_BAS)
+#define BAS_NOTIFY_MAX_RETRIES 5
+#define BAS_NOTIFY_RETRY_MS 200
+
+static uint8_t bas_notify_retries;
+
+static void zmk_battery_bas_notify_work_cb(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(battery_bas_notify_work, zmk_battery_bas_notify_work_cb);
+
 static void zmk_battery_bas_notify_work_cb(struct k_work *work) {
     uint8_t level = last_state_of_charge;
     if (bt_bas_get_battery_level() == level) {
+        bas_notify_retries = 0;
         return;
     }
     LOG_DBG("Setting BAS GATT battery level to %d.", level);
     int rc = bt_bas_set_battery_level(level);
+    if (rc == -EINVAL && bas_notify_retries < BAS_NOTIFY_MAX_RETRIES) {
+        bas_notify_retries++;
+        LOG_DBG("BAS notify: host not subscribed, retry %d/%d",
+                bas_notify_retries, BAS_NOTIFY_MAX_RETRIES);
+        k_work_reschedule(&battery_bas_notify_work, K_MSEC(BAS_NOTIFY_RETRY_MS));
+        return;
+    }
     if (rc != 0) {
         LOG_WRN("Failed to set BAS GATT battery level (err %d)", rc);
     }
+    bas_notify_retries = 0;
 }
-K_WORK_DEFINE(battery_bas_notify_work, zmk_battery_bas_notify_work_cb);
 #endif
 
 static int zmk_battery_update(const struct device *battery) {
@@ -128,7 +144,8 @@ static int zmk_battery_update(const struct device *battery) {
         // any thread that isn't sysworkq, so calling it directly from
         // lowprio_work_q would silently freeze that queue (and any work
         // sharing it, e.g. RGB underglow) when the ATT TX pool is exhausted.
-        k_work_submit(&battery_bas_notify_work);
+        bas_notify_retries = 0;
+        k_work_reschedule(&battery_bas_notify_work, K_NO_WAIT);
     }
 #endif
 
