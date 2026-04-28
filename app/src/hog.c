@@ -577,6 +577,19 @@ void send_mouse_report_callback(struct k_work *work) {
             .user_data = &hog_mouse_work,
         };
 
+#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+        /* Optimistic increment BEFORE send: if bt_gatt_notify_cb succeeds
+         * (returns 0) the completion CB will decrement.  On any error we
+         * roll back below.  This matches the pattern in service.c and
+         * prevents a window where the CB could fire before the counter
+         * is incremented. */
+        if (atomic_get(&mouse_in_flight) == 0) {
+            atomic_set(&mouse_oldest_send_time,
+                       (atomic_val_t)k_uptime_get_32());
+        }
+        atomic_inc(&mouse_in_flight);
+#endif
+
         int err = bt_gatt_notify_cb(conn, &notify_params);
         // -EINVAL: client not yet subscribed (BT_GATT_ENFORCE_SUBSCRIPTION).
         // At 80Hz TP, dropping reports here permanently kills the mouse
@@ -584,6 +597,7 @@ void send_mouse_report_callback(struct k_work *work) {
         if (err == -ENOMEM || err == -EINVAL) {
             bt_conn_unref(conn);
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+            atomic_dec(&mouse_in_flight);
             if (from_coalesce) {
                 k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
                 if (!mouse_coalesce_pending) {
@@ -610,19 +624,15 @@ void send_mouse_report_callback(struct k_work *work) {
         hog_mouse_retries = 0;
 
         if (err == -EPERM) {
+#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+            atomic_dec(&mouse_in_flight);
+#endif
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
-            LOG_DBG("Error notifying %d", err);
-        } else {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            /* Stamp the oldest-send-time on 0→1 transition for the
-             * stuck-detection window. */
-            if (atomic_get(&mouse_in_flight) == 0) {
-                atomic_set(&mouse_oldest_send_time,
-                           (atomic_val_t)k_uptime_get_32());
-            }
-            atomic_inc(&mouse_in_flight);
+            atomic_dec(&mouse_in_flight);
 #endif
+            LOG_DBG("Error notifying %d", err);
         }
 
         bt_conn_unref(conn);

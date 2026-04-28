@@ -359,6 +359,7 @@ config ZMK_BLE_DEEP_IDLE_LATENCY_INTERVALS
 config ZMK_BLE_DEEP_IDLE_TIMEOUT_S
     int "Supervision timeout for Idle-2 tier (seconds)"
     default 9
+    range 9 32
     help
       Must be longer than DEEP_IDLE_INTERVAL_MS * (1 + LATENCY) to survive
       a single missed window. RMK uses 9s with 20ms*200.

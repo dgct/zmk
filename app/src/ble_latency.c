@@ -59,6 +59,14 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #define IDLE_TIMEOUT_MS K_MSEC(CONFIG_ZMK_BLE_HID_IDLE_TIMEOUT_MS)
 
+BUILD_ASSERT(
+    (CONFIG_ZMK_BLE_DEEP_IDLE_TIMEOUT_S * 400U) >
+        ((1U + CONFIG_ZMK_BLE_DEEP_IDLE_LATENCY_INTERVALS) *
+         (CONFIG_ZMK_BLE_DEEP_IDLE_INTERVAL_MS * 1000U / 1250U)),
+    "ZMK_BLE_DEEP_IDLE_TIMEOUT_S too small for BLE spec: "
+    "supervision_timeout must exceed (1 + latency) * interval / 4 "
+    "(bt_conn_le_param_update will reject with -EINVAL)");
+
 enum {
     CONN_LOW_LATENCY_ENABLED = BIT(0),
     CONN_LOW_LATENCY_REQUIRED = BIT(1),
