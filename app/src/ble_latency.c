@@ -73,6 +73,7 @@ static uint8_t latency_state;
 static struct k_spinlock state_lock;
 static struct k_work_delayable idle_check_work;
 static struct k_work_delayable warmup_work;
+static struct k_work_delayable conn_update_timeout_work;
 
 struct snapshot {
     struct bt_conn *conn;
@@ -97,6 +98,18 @@ static void state_set_bit(uint8_t bit) {
 static void state_clear_bit(uint8_t bit) {
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     latency_state &= ~bit;
+    k_spin_unlock(&state_lock, key);
+}
+
+#define CONN_UPDATE_TIMEOUT_MS K_MSEC(2000)
+
+static void conn_update_timeout_fn(struct k_work *work) {
+    ARG_UNUSED(work);
+    k_spinlock_key_t key = k_spin_lock(&state_lock);
+    if (latency_state & CONN_UPDATE_PENDING) {
+        latency_state &= ~CONN_UPDATE_PENDING;
+        LOG_WRN("ble_latency: conn param update timed out (L2CAP rejection?)");
+    }
     k_spin_unlock(&state_lock, key);
 }
 
@@ -169,6 +182,7 @@ static void request_low_latency(void) {
 
     if (err == 0) {
         state_set_bit(CONN_UPDATE_PENDING);
+        k_work_reschedule(&conn_update_timeout_work, CONN_UPDATE_TIMEOUT_MS);
     }
     k_work_reschedule(&idle_check_work, IDLE_TIMEOUT_MS);
 }
@@ -181,6 +195,7 @@ static void request_idle_1(void) {
     int err = update_latency_only(s.conn, CONFIG_ZMK_BLE_HID_IDLE_LATENCY_INTERVALS);
     if (err == 0) {
         state_set_bit(CONN_UPDATE_PENDING);
+        k_work_reschedule(&conn_update_timeout_work, CONN_UPDATE_TIMEOUT_MS);
     }
 }
 
@@ -205,6 +220,7 @@ static void request_idle_2(void) {
         return;
     }
     state_set_bit(CONN_UPDATE_PENDING);
+    k_work_reschedule(&conn_update_timeout_work, CONN_UPDATE_TIMEOUT_MS);
 }
 
 static void idle_check_fn(struct k_work *work) {
@@ -262,6 +278,7 @@ static void warmup_fn(struct k_work *work) {
     int err = bt_conn_le_param_update(s.conn, &param);
     if (err == 0) {
         state_set_bit(CONN_UPDATE_PENDING);
+        k_work_reschedule(&conn_update_timeout_work, CONN_UPDATE_TIMEOUT_MS);
     } else if (err == -EALREADY) {
         k_work_reschedule(&warmup_work, K_MSEC(500));
     } else {
@@ -299,6 +316,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
     if (was_active) {
         k_work_cancel_delayable(&idle_check_work);
         k_work_cancel_delayable(&warmup_work);
+        k_work_cancel_delayable(&conn_update_timeout_work);
     }
 }
 
@@ -343,6 +361,7 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
         }
     }
     k_spin_unlock(&state_lock, key);
+    k_work_cancel_delayable(&conn_update_timeout_work);
     if (restore) {
         request_low_latency();
     }
@@ -410,6 +429,7 @@ INPUT_CALLBACK_DEFINE(NULL, ble_latency_input_listener, NULL);
 static int ble_latency_init(void) {
     k_work_init_delayable(&idle_check_work, idle_check_fn);
     k_work_init_delayable(&warmup_work, warmup_fn);
+    k_work_init_delayable(&conn_update_timeout_work, conn_update_timeout_fn);
     return 0;
 }
 
