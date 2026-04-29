@@ -477,6 +477,13 @@ void zmk_endpoint_clear_reports(void) {
 
     zmk_endpoint_send_report(HID_USAGE_KEY);
     zmk_endpoint_send_report(HID_USAGE_CONSUMER);
+
+#if IS_ENABLED(CONFIG_ZMK_POINTING)
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+    zmk_hog_mouse_clear_queue();
+#endif
+    zmk_endpoint_send_mouse_report();
+#endif
 }
 
 static void update_current_endpoint(void) {

@@ -464,6 +464,8 @@ void zmk_hid_mouse_scroll_update(int16_t hwheel, int16_t wheel) {
 void zmk_hid_mouse_clear(void) {
     LOG_DBG("Mouse report cleared");
     memset(&mouse_report.body, 0, sizeof(mouse_report.body));
+    memset(explicit_button_counts, 0, sizeof(explicit_button_counts));
+    explicit_buttons = 0;
 }
 
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)

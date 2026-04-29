@@ -687,6 +687,19 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
 
     return 0;
 };
+
+void zmk_hog_mouse_clear_queue(void) {
+    k_msgq_purge(&zmk_hog_mouse_msgq);
+    hog_mouse_retries = 0;
+#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+    k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+    mouse_coalesce = (struct zmk_hid_mouse_report_body){0};
+    mouse_coalesce_pending = false;
+    k_spin_unlock(&mouse_coalesce_lock, key);
+    atomic_set(&mouse_in_flight, 0);
+    atomic_set(&mouse_oldest_send_time, 0);
+#endif
+}
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
 #if IS_ENABLED(CONFIG_ZMK_HOG_RELEASE_ON_DISCONNECT)
