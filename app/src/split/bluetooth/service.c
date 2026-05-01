@@ -419,6 +419,17 @@ struct input_notify_entry {
     struct zmk_split_input_event_payload payload;
 };
 
+/* Motion coalesce buffer: accumulates packed XY deltas under backpressure
+ * instead of queueing them individually. Non-motion events (buttons, keys)
+ * bypass via the msgq to preserve ordering and edge semantics.
+ */
+static struct input_notify_entry motion_coalesce;
+static bool motion_coalesce_pending;
+static struct k_spinlock motion_coalesce_lock;
+
+/* The msgq is still used for non-motion events (buttons, keys, sensors)
+ * which cannot be coalesced and need FIFO ordering.
+ */
 #define INPUT_NOTIFY_QUEUE_DEPTH 16
 
 K_MSGQ_DEFINE(input_notify_msgq, sizeof(struct input_notify_entry), INPUT_NOTIFY_QUEUE_DEPTH, 4);
@@ -437,6 +448,9 @@ void input_notify_work_cb(struct k_work *work) {
         input_notify_retries = 0;
         atomic_clear(&input_notify_in_flight_count);
         atomic_set(&input_notify_oldest_send_time, 0);
+        k_spinlock_key_t key = k_spin_lock(&motion_coalesce_lock);
+        motion_coalesce_pending = false;
+        k_spin_unlock(&motion_coalesce_lock, key);
         return;
     }
 
@@ -459,19 +473,24 @@ void input_notify_work_cb(struct k_work *work) {
         atomic_set(&input_notify_oldest_send_time, 0);
     }
 
-    /* Drain the msgq up to MAX_IN_FLIGHT. Each bt_gatt_notify_cb call is
-     * non-blocking (~1 µs: build PDU, memcpy payload, k_fifo_put). Looping
-     * here is safe — no risk of starving sysworkq.
-     *
-     * The completion CB runs on conn_tx_workq (CONFIG_BT_CONN_TX_NOTIFY_WQ=y)
-     * and may decrement the counter concurrently with this loop. That's fine:
-     * atomic_get re-reads each iteration, so we naturally pick up freed slots.
+    /* Drain entries up to MAX_IN_FLIGHT. Non-motion events in the msgq
+     * have priority (buttons must not be delayed by motion). After the
+     * msgq is empty, drain the motion coalesce buffer.
      */
     while (atomic_get(&input_notify_in_flight_count) <
            CONFIG_ZMK_INPUT_SPLIT_MAX_IN_FLIGHT) {
         if (!current_entry_held) {
+            /* Try msgq first (non-motion events). */
             if (k_msgq_get(&input_notify_msgq, &current_entry, K_NO_WAIT) != 0) {
-                return; /* Queue empty. */
+                /* Msgq empty: try motion coalesce buffer. */
+                k_spinlock_key_t key = k_spin_lock(&motion_coalesce_lock);
+                if (!motion_coalesce_pending) {
+                    k_spin_unlock(&motion_coalesce_lock, key);
+                    return; /* Nothing to send. */
+                }
+                current_entry = motion_coalesce;
+                motion_coalesce_pending = false;
+                k_spin_unlock(&motion_coalesce_lock, key);
             }
             input_notify_retries = 0;
         }
@@ -540,6 +559,58 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
         if (bt_uuid_cmp(split_svc.attrs[i].uuid,
                         BT_UUID_DECLARE_128(ZMK_SPLIT_BT_INPUT_EVENT_UUID)) == 0 &&
             (uint8_t)(uint32_t)split_svc.attrs[i + 2].user_data == reg) {
+
+            /* Packed XY motion: coalesce into accumulator buffer. */
+            if (type == INPUT_EV_REL && code == ZMK_SPLIT_BT_INPUT_PACKED_XY_CODE) {
+                uint32_t packed = (uint32_t)value;
+                int16_t new_x = (int16_t)(uint16_t)(packed & 0xFFFFU);
+                int16_t new_y = (int16_t)(uint16_t)((packed >> 16) & 0xFFFFU);
+
+                k_spinlock_key_t key = k_spin_lock(&motion_coalesce_lock);
+                if (motion_coalesce_pending &&
+                    motion_coalesce.attr == &split_svc.attrs[i] &&
+                    motion_coalesce.payload.code == ZMK_SPLIT_BT_INPUT_PACKED_XY_CODE) {
+                    /* Sum into existing pending motion. */
+                    uint32_t old_packed = motion_coalesce.payload.value;
+                    int32_t ox = (int16_t)(uint16_t)(old_packed & 0xFFFFU);
+                    int32_t oy = (int16_t)(uint16_t)((old_packed >> 16) & 0xFFFFU);
+                    int16_t sx = (int16_t)CLAMP(ox + new_x, INT16_MIN, INT16_MAX);
+                    int16_t sy = (int16_t)CLAMP(oy + new_y, INT16_MIN, INT16_MAX);
+                    motion_coalesce.payload.value =
+                        ((uint32_t)(uint16_t)sx) | (((uint32_t)(uint16_t)sy) << 16);
+                } else {
+                    motion_coalesce.attr = &split_svc.attrs[i];
+                    motion_coalesce.payload = (struct zmk_split_input_event_payload){
+                        .type = type,
+                        .code = code,
+                        .value = value,
+                        .sync = sync ? 1 : 0,
+                    };
+                    motion_coalesce_pending = true;
+                }
+                k_spin_unlock(&motion_coalesce_lock, key);
+                k_work_schedule(&input_notify_work, K_NO_WAIT);
+                return 0;
+            }
+
+            /* Non-motion event: flush pending motion first (ordering),
+             * then queue through msgq. */
+            k_spinlock_key_t key = k_spin_lock(&motion_coalesce_lock);
+            if (motion_coalesce_pending) {
+                struct input_notify_entry motion_entry = motion_coalesce;
+                motion_coalesce_pending = false;
+                k_spin_unlock(&motion_coalesce_lock, key);
+                /* Best-effort flush — if msgq is full, the motion is lost
+                 * but the button/key event takes priority. */
+                if (k_msgq_put(&input_notify_msgq, &motion_entry, K_NO_WAIT) != 0) {
+                    struct input_notify_entry discard;
+                    k_msgq_get(&input_notify_msgq, &discard, K_NO_WAIT);
+                    (void)k_msgq_put(&input_notify_msgq, &motion_entry, K_NO_WAIT);
+                }
+            } else {
+                k_spin_unlock(&motion_coalesce_lock, key);
+            }
+
             struct input_notify_entry entry = {
                 .attr = &split_svc.attrs[i],
                 .payload = {
@@ -550,7 +621,6 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
                 },
             };
             if (k_msgq_put(&input_notify_msgq, &entry, K_NO_WAIT) != 0) {
-                /* Queue full: drop the oldest pending entry and requeue. */
                 struct input_notify_entry discard;
                 k_msgq_get(&input_notify_msgq, &discard, K_NO_WAIT);
                 (void)k_msgq_put(&input_notify_msgq, &entry, K_NO_WAIT);
