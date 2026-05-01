@@ -6,6 +6,7 @@
 
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/types.h>
+#include <zephyr/dt-bindings/input/input-event-codes.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/atomic.h>
