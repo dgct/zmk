@@ -855,6 +855,14 @@ module = ZMK
 module-str = zmk
 source "subsys/logging/Kconfig.template.log_config"
 
+module = ZMK_HOG
+module-str = zmk_hog
+source "subsys/logging/Kconfig.template.log_config"
+
+module = ZMK_SPLIT_SERVICE
+module-str = zmk_split_service
+source "subsys/logging/Kconfig.template.log_config"
+
 # This loads ZMK's internal board and shield Kconfigs
 rsource "boards/Kconfig"
 rsource "boards/shields/*/Kconfig.defconfig"
