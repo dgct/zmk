@@ -257,30 +257,3 @@ static void split_input_send_event(uint8_t reg, uint8_t type, uint16_t code, int
 #endif
 
 DT_INST_FOREACH_STATUS_OKAY(ZIS_INST)
-
-/* Connection-event-aligned flush: on each BLE connection event boundary,
- * cancel the pending FLUSH_MS timer and immediately drain all input split
- * accumulators. This synchronises motion report delivery with the radio
- * schedule, eliminating the beat-pattern jitter between TP sample rate
- * (200 Hz / 5 ms) and BLE connection interval (7.5 ms). */
-#if !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL) && IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT_CONN_EVENT_FLUSH)
-
-#include <zmk/sdc/conn_event_flush.h>
-
-#define ZIS_CE_FLUSH(n)                                                                            \
-    k_work_cancel_delayable(&zis_flush_work_##n);                                                  \
-    zis_do_flush_##n();
-
-static void zis_flush_all_ce(void)
-{
-    DT_INST_FOREACH_STATUS_OKAY(ZIS_CE_FLUSH)
-}
-
-static int input_split_ce_init(void)
-{
-    return zmk_sdc_conn_event_flush_register(zis_flush_all_ce);
-}
-
-SYS_INIT(input_split_ce_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
-
-#endif /* CE flush */

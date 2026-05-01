@@ -118,19 +118,6 @@ config ZMK_INPUT_SPLIT_MAX_IN_FLIGHT
       position/sensor/SMP notifies are not starved. 1 restores legacy
       single-in-flight back-pressure (useful for bisecting regressions).
 
-config ZMK_INPUT_SPLIT_CONN_EVENT_FLUSH
-    bool "Connection-event-aligned input flush"
-    depends on ZMK_SDC_CONN_EVENT_FLUSH
-    depends on ZMK_INPUT_SPLIT_FLUSH_MS > 0
-    help
-      Flush the split input accumulator at each BLE connection event
-      boundary using SDC anchor point reports. Eliminates beat-pattern
-      jitter between the input sample rate and the BLE connection interval.
-      The FLUSH_MS timer serves as a fallback for boot, disconnect, and
-      first-packet-after-idle when anchor point reports are not yet active.
-      Set FLUSH_MS > CI (e.g. 10 for 7.5ms CI) so the CE callback always
-      fires first.
-
 endif # ZMK_INPUT_SPLIT
 
 endif # ZMK_POINTING
