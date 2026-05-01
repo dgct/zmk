@@ -498,8 +498,10 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
 
 #if IS_ENABLED(CONFIG_ZMK_POINTING)
 
+#if !IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
 K_MSGQ_DEFINE(zmk_hog_mouse_msgq, sizeof(struct zmk_hid_mouse_report_body),
               CONFIG_ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE, 4);
+#endif
 
 static int hog_mouse_retries;
 
@@ -533,12 +535,9 @@ void send_mouse_report_callback(struct k_work *work) {
                 return;
             }
         }
-#endif
 
-        bool from_coalesce = false;
-        if (k_msgq_peek(&zmk_hog_mouse_msgq, &report) != 0) {
-#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            /* Queue empty: flush any pending coalesced motion. */
+        /* Snapshot and clear the coalesce buffer. */
+        {
             k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
             if (!mouse_coalesce_pending) {
                 k_spin_unlock(&mouse_coalesce_lock, key);
@@ -547,24 +546,23 @@ void send_mouse_report_callback(struct k_work *work) {
             report = mouse_coalesce;
             mouse_coalesce_pending = false;
             k_spin_unlock(&mouse_coalesce_lock, key);
-            from_coalesce = true;
-#else
-            return;
-#endif
         }
+#else
+        if (k_msgq_peek(&zmk_hog_mouse_msgq, &report) != 0) {
+            return;
+        }
+#endif
 
         struct bt_conn *conn = zmk_ble_active_profile_conn();
         if (conn == NULL) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            if (from_coalesce) {
-                /* Restore the coalesced report so we don't lose it. */
-                k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
-                if (!mouse_coalesce_pending) {
-                    mouse_coalesce = report;
-                    mouse_coalesce_pending = true;
-                }
-                k_spin_unlock(&mouse_coalesce_lock, key);
+            /* Restore report so we don't lose it. */
+            k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+            if (!mouse_coalesce_pending) {
+                mouse_coalesce = report;
+                mouse_coalesce_pending = true;
             }
+            k_spin_unlock(&mouse_coalesce_lock, key);
 #endif
             return;
         }
@@ -580,9 +578,7 @@ void send_mouse_report_callback(struct k_work *work) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
         /* Optimistic increment BEFORE send: if bt_gatt_notify_cb succeeds
          * (returns 0) the completion CB will decrement.  On any error we
-         * roll back below.  This matches the pattern in service.c and
-         * prevents a window where the CB could fire before the counter
-         * is incremented. */
+         * roll back below. */
         if (atomic_get(&mouse_in_flight) == 0) {
             atomic_set(&mouse_oldest_send_time,
                        (atomic_val_t)k_uptime_get_32());
@@ -591,26 +587,24 @@ void send_mouse_report_callback(struct k_work *work) {
 #endif
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
-        // -EINVAL: client not yet subscribed (BT_GATT_ENFORCE_SUBSCRIPTION).
-        // At 80Hz TP, dropping reports here permanently kills the mouse
-        // pipeline if we don't retry until the host completes subscription.
         if (err == -ENOMEM || err == -EINVAL) {
             bt_conn_unref(conn);
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
             atomic_dec(&mouse_in_flight);
-            if (from_coalesce) {
-                k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
-                if (!mouse_coalesce_pending) {
-                    mouse_coalesce = report;
-                    mouse_coalesce_pending = true;
-                }
-                k_spin_unlock(&mouse_coalesce_lock, key);
+            /* Restore report to coalesce buffer. */
+            k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+            if (!mouse_coalesce_pending) {
+                mouse_coalesce = report;
+                mouse_coalesce_pending = true;
             }
+            k_spin_unlock(&mouse_coalesce_lock, key);
 #endif
             if (++hog_mouse_retries > HOG_NOTIFY_MAX_RETRIES) {
-                LOG_WRN("Notify exhaustion: dropping mouse queue (err %d, %d retries)",
+                LOG_WRN("Notify exhaustion: dropping mouse reports (err %d, %d retries)",
                         err, HOG_NOTIFY_MAX_RETRIES);
+#if !IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
                 k_msgq_purge(&zmk_hog_mouse_msgq);
+#endif
                 hog_mouse_retries = 0;
                 return;
             }
@@ -618,9 +612,9 @@ void send_mouse_report_callback(struct k_work *work) {
             return;
         }
 
-        if (!from_coalesce) {
-            k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT);
-        }
+#if !IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+        k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT);
+#endif
         hog_mouse_retries = 0;
 
         if (err == -EPERM) {
@@ -641,35 +635,31 @@ void send_mouse_report_callback(struct k_work *work) {
 
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-    /* Pipeline saturated: merge into coalesce buffer instead of queueing.
-     * Sums motion/scroll deltas, latches buttons (last-value-wins).
-     * Mirrors RMK's hid_provider/mouse.rs accumulator pattern. */
-    if (atomic_get(&mouse_in_flight) >= CONFIG_ZMK_HOG_MOUSE_PIPELINE_DEPTH) {
-        k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
-        if (mouse_coalesce_pending) {
-            int32_t x = (int32_t)mouse_coalesce.d_x + report->d_x;
-            int32_t y = (int32_t)mouse_coalesce.d_y + report->d_y;
-            int32_t sx = (int32_t)mouse_coalesce.d_scroll_x + report->d_scroll_x;
-            int32_t sy = (int32_t)mouse_coalesce.d_scroll_y + report->d_scroll_y;
-            mouse_coalesce.d_x = CLAMP(x, INT16_MIN, INT16_MAX);
-            mouse_coalesce.d_y = CLAMP(y, INT16_MIN, INT16_MAX);
-            mouse_coalesce.d_scroll_x = CLAMP(sx, INT16_MIN, INT16_MAX);
-            mouse_coalesce.d_scroll_y = CLAMP(sy, INT16_MIN, INT16_MAX);
-            mouse_coalesce.buttons = report->buttons;
-        } else {
-            mouse_coalesce = *report;
-            mouse_coalesce_pending = true;
-        }
-        k_spin_unlock(&mouse_coalesce_lock, key);
-        k_work_schedule(&hog_mouse_work, K_NO_WAIT);
-        return 0;
+    /* Always accumulate into the coalesce buffer. The send worker snapshots
+     * and clears it when a pipeline slot is available. Under backpressure,
+     * deltas sum into one report instead of queueing individually. */
+    k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+    if (mouse_coalesce_pending) {
+        int32_t x = (int32_t)mouse_coalesce.d_x + report->d_x;
+        int32_t y = (int32_t)mouse_coalesce.d_y + report->d_y;
+        int32_t sx = (int32_t)mouse_coalesce.d_scroll_x + report->d_scroll_x;
+        int32_t sy = (int32_t)mouse_coalesce.d_scroll_y + report->d_scroll_y;
+        mouse_coalesce.d_x = CLAMP(x, INT16_MIN, INT16_MAX);
+        mouse_coalesce.d_y = CLAMP(y, INT16_MIN, INT16_MAX);
+        mouse_coalesce.d_scroll_x = CLAMP(sx, INT16_MIN, INT16_MAX);
+        mouse_coalesce.d_scroll_y = CLAMP(sy, INT16_MIN, INT16_MAX);
+        mouse_coalesce.buttons = report->buttons;
+    } else {
+        mouse_coalesce = *report;
+        mouse_coalesce_pending = true;
     }
-#endif
-
+    k_spin_unlock(&mouse_coalesce_lock, key);
+    k_work_schedule(&hog_mouse_work, K_NO_WAIT);
+    return 0;
+#else
     int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_NO_WAIT);
     if (err) {
         switch (err) {
-        /* k_msgq_put() with K_NO_WAIT returns -ENOMSG when the queue is full. */
         case -ENOMSG:
         case -EAGAIN: {
             LOG_WRN("Mouse message queue full, popping first message and queueing again");
@@ -684,12 +674,14 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
     }
 
     k_work_schedule(&hog_mouse_work, K_NO_WAIT);
-
     return 0;
+#endif
 };
 
 void zmk_hog_mouse_clear_queue(void) {
+#if !IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
     k_msgq_purge(&zmk_hog_mouse_msgq);
+#endif
     hog_mouse_retries = 0;
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
     k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
