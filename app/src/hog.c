@@ -310,7 +310,7 @@ BT_GATT_SERVICE_DEFINE(
  */
 static atomic_t mouse_in_flight;
 /* Timestamp (k_uptime_get_32) of the oldest un-completed notify.
- * Used solely by the 500ms stuck-recovery path.  Reset to 0 when the
+ * Used solely by the stuck-recovery path.  Reset to 0 when the
  * last in-flight completes or when stuck-recovery fires. */
 static atomic_t mouse_oldest_send_time = ATOMIC_INIT(0);
 static struct zmk_hid_mouse_report_body mouse_coalesce;
@@ -514,13 +514,13 @@ void send_mouse_report_callback(struct k_work *work) {
          * window. Notify-completion callback re-triggers this worker. */
         if (atomic_get(&mouse_in_flight) >= CONFIG_ZMK_HOG_MOUSE_PIPELINE_DEPTH) {
             /* Stuck-recovery: if the oldest in-flight has been pending for
-             * >500ms the BT stack silently dropped the completion callback.
-             * Reset the counter so the pipeline doesn't block forever.
-             * Mirrors the pattern in service.c input_notify_work_cb. */
+             * longer than the configured threshold, the BT stack silently
+             * dropped the completion callback. Reset the counter so the
+             * pipeline doesn't block forever. */
             uint32_t oldest = (uint32_t)atomic_get(&mouse_oldest_send_time);
             if (oldest != 0) {
                 uint32_t elapsed = k_uptime_get_32() - oldest;
-                if (elapsed > 500) {
+                if (elapsed > CONFIG_ZMK_HOG_MOUSE_PIPELINE_STUCK_MS) {
                     LOG_WRN("HOG mouse pipeline stuck (%ld in-flight) for %u ms, recovering",
                             (long)atomic_get(&mouse_in_flight), elapsed);
                     atomic_clear(&mouse_in_flight);

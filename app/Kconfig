@@ -280,6 +280,16 @@ config ZMK_HOG_MOUSE_PIPELINE_DEPTH
       and lets two notifies overlap radio time without unbounded
       queue growth.
 
+config ZMK_HOG_MOUSE_PIPELINE_STUCK_MS
+    int "Stuck-recovery timeout for mouse pipeline (ms)"
+    depends on ZMK_HOG_MOUSE_PIPELINE
+    default 150
+    help
+      If the oldest in-flight mouse notify has been pending longer than
+      this, assume the BT stack silently dropped the completion callback
+      and reset the pipeline. Lower values recover cursor motion faster
+      at the cost of potentially false-triggering on slow hosts.
+
 config ZMK_HOG_RELEASE_ON_DISCONNECT
     bool "Release HID state on HOG host BLE disconnect"
     depends on ZMK_BLE
