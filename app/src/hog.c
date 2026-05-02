@@ -583,6 +583,13 @@ void send_mouse_report_callback(struct k_work *work) {
         if (err == -EPERM) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
             atomic_clear(&mouse_in_flight);
+            /* Restore report — notify was rejected pre-security. */
+            k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+            if (!mouse_coalesce_pending) {
+                mouse_coalesce = report;
+                mouse_coalesce_pending = true;
+            }
+            k_spin_unlock(&mouse_coalesce_lock, key);
 #endif
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
