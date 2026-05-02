@@ -309,10 +309,6 @@ BT_GATT_SERVICE_DEFINE(
  * hid_provider/mouse.rs motion-event synchronization. Mouse-only.
  */
 static atomic_t mouse_in_flight;
-/* Timestamp (k_uptime_get_32) of the oldest un-completed notify.
- * Used solely by the stuck-recovery path.  Reset to 0 when the
- * last in-flight completes or when stuck-recovery fires. */
-static atomic_t mouse_oldest_send_time = ATOMIC_INIT(0);
 static struct zmk_hid_mouse_report_body mouse_coalesce;
 static bool mouse_coalesce_pending;
 static struct k_spinlock mouse_coalesce_lock;
@@ -323,17 +319,7 @@ static void hog_notify_complete(struct bt_conn *conn, void *user_data) {
     struct k_work_delayable *work = (struct k_work_delayable *)user_data;
 #if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
     if (work == &hog_mouse_work) {
-        /* Guard against underflow: a late completion callback can fire after
-         * hog_host_disconnected() has already reset the counter to 0.
-         * The underflow is benign (counter goes negative, gate stays open)
-         * but guarding keeps the counter semantically correct. */
-        atomic_val_t prev = atomic_get(&mouse_in_flight);
-        if (prev > 0) {
-            if (atomic_dec(&mouse_in_flight) == 1) {
-                /* Last in-flight completed — clear the timestamp. */
-                atomic_set(&mouse_oldest_send_time, 0);
-            }
-        }
+        atomic_clear(&mouse_in_flight);
     }
 #endif
     k_work_reschedule(work, K_NO_WAIT);
@@ -512,28 +498,10 @@ void send_mouse_report_callback(struct k_work *work) {
     struct zmk_hid_mouse_report_body report;
     while (true) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-        /* Pipeline gate: don't dispatch more notifies than the configured
-         * window. Notify-completion callback re-triggers this worker. */
-        if (atomic_get(&mouse_in_flight) >= CONFIG_ZMK_HOG_MOUSE_PIPELINE_DEPTH) {
-            /* Stuck-recovery: if the oldest in-flight has been pending for
-             * longer than the configured threshold, the BT stack silently
-             * dropped the completion callback. Reset the counter so the
-             * pipeline doesn't block forever. */
-            uint32_t oldest = (uint32_t)atomic_get(&mouse_oldest_send_time);
-            if (oldest != 0) {
-                uint32_t elapsed = k_uptime_get_32() - oldest;
-                if (elapsed > CONFIG_ZMK_HOG_MOUSE_PIPELINE_STUCK_MS) {
-                    LOG_WRN("HOG mouse pipeline stuck (%ld in-flight) for %u ms, recovering",
-                            (long)atomic_get(&mouse_in_flight), elapsed);
-                    atomic_clear(&mouse_in_flight);
-                    atomic_set(&mouse_oldest_send_time, 0);
-                    /* Fall through to drain. */
-                } else {
-                    return;
-                }
-            } else {
-                return;
-            }
+        /* Event-driven gate: one notify in flight at a time.
+         * Completion callback re-triggers this worker. */
+        if (atomic_get(&mouse_in_flight) != 0) {
+            return;
         }
 
         /* Snapshot and clear the coalesce buffer. */
@@ -576,21 +544,16 @@ void send_mouse_report_callback(struct k_work *work) {
         };
 
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-        /* Optimistic increment BEFORE send: if bt_gatt_notify_cb succeeds
-         * (returns 0) the completion CB will decrement.  On any error we
-         * roll back below. */
-        if (atomic_get(&mouse_in_flight) == 0) {
-            atomic_set(&mouse_oldest_send_time,
-                       (atomic_val_t)k_uptime_get_32());
-        }
-        atomic_inc(&mouse_in_flight);
+        /* Optimistic set BEFORE send: completion CB clears back to 0.
+         * On any error we roll back below. */
+        atomic_set(&mouse_in_flight, 1);
 #endif
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
         if (err == -ENOMEM || err == -EINVAL) {
             bt_conn_unref(conn);
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            atomic_dec(&mouse_in_flight);
+            atomic_clear(&mouse_in_flight);
             /* Restore report to coalesce buffer. */
             k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
             if (!mouse_coalesce_pending) {
@@ -619,12 +582,12 @@ void send_mouse_report_callback(struct k_work *work) {
 
         if (err == -EPERM) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            atomic_dec(&mouse_in_flight);
+            atomic_clear(&mouse_in_flight);
 #endif
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            atomic_dec(&mouse_in_flight);
+            atomic_clear(&mouse_in_flight);
 #endif
             LOG_DBG("Error notifying %d", err);
         }
@@ -688,8 +651,7 @@ void zmk_hog_mouse_clear_queue(void) {
     mouse_coalesce = (struct zmk_hid_mouse_report_body){0};
     mouse_coalesce_pending = false;
     k_spin_unlock(&mouse_coalesce_lock, key);
-    atomic_set(&mouse_in_flight, 0);
-    atomic_set(&mouse_oldest_send_time, 0);
+    atomic_clear(&mouse_in_flight);
 #endif
 }
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
@@ -727,8 +689,7 @@ static void hog_host_disconnected(struct bt_conn *conn, uint8_t reason) {
         mouse_coalesce_pending = false;
         k_spin_unlock(&mouse_coalesce_lock, key);
     }
-    atomic_set(&mouse_in_flight, 0);
-    atomic_set(&mouse_oldest_send_time, 0);
+    atomic_clear(&mouse_in_flight);
 #endif
 
     /* Only clear the global HID register state if the dropped connection

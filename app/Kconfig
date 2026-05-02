@@ -259,36 +259,14 @@ config ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE
     default 20
 
 config ZMK_HOG_MOUSE_PIPELINE
-    bool "Limit in-flight HOG mouse notifies and coalesce overflow"
+    bool "Event-driven HOG mouse flow control with coalescing"
     depends on ZMK_POINTING
     help
-      Mirrors nRF Desktop's HIDS_SUBSCRIBER_PIPELINE_SIZE pattern
-      (applications/nrf_desktop/src/hids.c) and RMK's
-      hid_provider/mouse.rs motion-event synchronization. Caps the
-      number of mouse notifies in flight at any time; when the cap is
-      reached, additional reports are coalesced (motion/scroll deltas
-      summed, buttons latched) into a single pending report instead of
-      being dropped or overflowing the queue.
-
-config ZMK_HOG_MOUSE_PIPELINE_DEPTH
-    int "In-flight mouse notify cap"
-    depends on ZMK_HOG_MOUSE_PIPELINE
-    range 1 4
-    default 2
-    help
-      2 matches both nRF Desktop and our split central MAX_IN_FLIGHT
-      and lets two notifies overlap radio time without unbounded
-      queue growth.
-
-config ZMK_HOG_MOUSE_PIPELINE_STUCK_MS
-    int "Stuck-recovery timeout for mouse pipeline (ms)"
-    depends on ZMK_HOG_MOUSE_PIPELINE
-    default 150
-    help
-      If the oldest in-flight mouse notify has been pending longer than
-      this, assume the BT stack silently dropped the completion callback
-      and reset the pipeline. Lower values recover cursor motion faster
-      at the cost of potentially false-triggering on slow hosts.
+      Event-driven single-send model: one mouse notify in flight at a
+      time, completion callback re-triggers the send worker. Under
+      backpressure, additional reports are coalesced (motion/scroll
+      deltas summed, buttons latched) into a single pending report
+      instead of being dropped or overflowing the queue.
 
 config ZMK_HOG_RELEASE_ON_DISCONNECT
     bool "Release HID state on HOG host BLE disconnect"
