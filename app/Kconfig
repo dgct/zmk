@@ -268,6 +268,23 @@ config ZMK_HOG_MOUSE_PIPELINE
       deltas summed, buttons latched) into a single pending report
       instead of being dropped or overflowing the queue.
 
+config ZMK_HOG_MOUSE_PIPELINE_SIZE
+    int "HOG mouse pipeline depth"
+    default 1
+    range 1 4
+    depends on ZMK_HOG_MOUSE_PIPELINE
+    help
+      Maximum number of mouse HID notifications in flight simultaneously
+      on the HOG (host) BLE link. Depth=1 is the original single-send
+      model (max ~88 reports/s at 11.25ms CI). Depth=2 allows pipelining
+      two notifications in the BLE controller, roughly doubling throughput
+      to ~177 reports/s at 11.25ms CI (one being transmitted while the
+      next is queued). Higher depths are possible but unlikely to help
+      since the host CI is the true bottleneck.
+
+      The coalesce buffer absorbs excess reports when all pipeline slots
+      are occupied.
+
 config ZMK_HOG_RELEASE_ON_DISCONNECT
     bool "Release HID state on HOG host BLE disconnect"
     depends on ZMK_BLE

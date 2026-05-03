@@ -307,7 +307,13 @@ BT_GATT_SERVICE_DEFINE(
 #if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
 /* Mirrors nRF Desktop hids.c HIDS_SUBSCRIBER_PIPELINE_SIZE + RMK
  * hid_provider/mouse.rs motion-event synchronization. Mouse-only.
+ *
+ * mouse_in_flight: counter (0..PIPELINE_SIZE) of notifications currently
+ * in the BLE controller. Each bt_gatt_notify_cb() increments; each
+ * hog_notify_complete() decrements. When the counter reaches PIPELINE_SIZE,
+ * new reports coalesce in mouse_coalesce until a completion fires.
  */
+#define HOG_MOUSE_PIPELINE_SIZE CONFIG_ZMK_HOG_MOUSE_PIPELINE_SIZE
 static atomic_t mouse_in_flight;
 static struct zmk_hid_mouse_report_body mouse_coalesce;
 static bool mouse_coalesce_pending;
@@ -319,7 +325,7 @@ static void hog_notify_complete(struct bt_conn *conn, void *user_data) {
     struct k_work_delayable *work = (struct k_work_delayable *)user_data;
 #if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
     if (work == &hog_mouse_work) {
-        atomic_clear(&mouse_in_flight);
+        atomic_dec(&mouse_in_flight);
     }
 #endif
     k_work_reschedule(work, K_NO_WAIT);
@@ -498,9 +504,9 @@ void send_mouse_report_callback(struct k_work *work) {
     struct zmk_hid_mouse_report_body report;
     while (true) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-        /* Event-driven gate: one notify in flight at a time.
-         * Completion callback re-triggers this worker. */
-        if (atomic_get(&mouse_in_flight) != 0) {
+        /* Event-driven gate: up to PIPELINE_SIZE notifies in flight.
+         * Completion callbacks decrement and re-trigger this worker. */
+        if (atomic_get(&mouse_in_flight) >= HOG_MOUSE_PIPELINE_SIZE) {
             return;
         }
 
@@ -544,16 +550,17 @@ void send_mouse_report_callback(struct k_work *work) {
         };
 
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-        /* Optimistic set BEFORE send: completion CB clears back to 0.
+        /* Optimistic increment BEFORE send: completion CB decrements.
          * On any error we roll back below. */
-        atomic_set(&mouse_in_flight, 1);
+        atomic_inc(&mouse_in_flight);
 #endif
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
         if (err == -ENOMEM || err == -EINVAL) {
             bt_conn_unref(conn);
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            atomic_clear(&mouse_in_flight);
+            /* Roll back optimistic increment — completion CB won't fire. */
+            atomic_dec(&mouse_in_flight);
             /* Restore report to coalesce buffer. */
             k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
             if (!mouse_coalesce_pending) {
@@ -582,7 +589,7 @@ void send_mouse_report_callback(struct k_work *work) {
 
         if (err == -EPERM) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            atomic_clear(&mouse_in_flight);
+            atomic_dec(&mouse_in_flight);
             /* Restore report — notify was rejected pre-security. */
             k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
             if (!mouse_coalesce_pending) {
@@ -594,7 +601,7 @@ void send_mouse_report_callback(struct k_work *work) {
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            atomic_clear(&mouse_in_flight);
+            atomic_dec(&mouse_in_flight);
 #endif
             LOG_DBG("Error notifying %d", err);
         }
