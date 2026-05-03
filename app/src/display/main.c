@@ -65,7 +65,10 @@ void unblank_display_cb(struct k_work *work) {
 #if DT_HAS_CHOSEN(zmk_display_led)
     led_on(display_led, display_led_idx);
 #endif
-    display_blanking_off(display);
+    int err = display_blanking_off(display);
+    if (err && err != -ENOTSUP) {
+        LOG_ERR("display_blanking_off failed: %d", err);
+    }
 #if !IS_ENABLED(CONFIG_ARCH_POSIX)
     k_timer_start(&display_timer, K_MSEC(CONFIG_ZMK_DISPLAY_TICK_PERIOD_MS),
                   K_MSEC(CONFIG_ZMK_DISPLAY_TICK_PERIOD_MS));
@@ -78,7 +81,10 @@ void blank_display_cb(struct k_work *work) {
 #if !IS_ENABLED(CONFIG_ARCH_POSIX)
     k_timer_stop(&display_timer);
 #endif // !IS_ENABLED(CONFIG_ARCH_POSIX)
-    display_blanking_on(display);
+    int err = display_blanking_on(display);
+    if (err && err != -ENOTSUP) {
+        LOG_ERR("display_blanking_on failed: %d", err);
+    }
 #if DT_HAS_CHOSEN(zmk_display_led)
     led_off(display_led, display_led_idx);
 #endif

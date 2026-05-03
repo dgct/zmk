@@ -109,7 +109,7 @@ static void state_clear_bit(uint8_t bit) {
     k_spin_unlock(&state_lock, key);
 }
 
-#define CONN_UPDATE_TIMEOUT_MS K_MSEC(2000)
+#define CONN_UPDATE_TIMEOUT_MS K_MSEC(5000)
 
 static void conn_update_timeout_fn(struct k_work *work) {
     ARG_UNUSED(work);
