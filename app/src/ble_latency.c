@@ -227,8 +227,13 @@ static void request_idle_2(void) {
         LOG_WRN("ble_latency: deep idle update failed (%d)", err);
         return;
     }
-    state_set_bit(CONN_UPDATE_PENDING);
-    k_work_reschedule(&conn_update_timeout_work, CONN_UPDATE_TIMEOUT_MS);
+    if (err == 0) {
+        state_set_bit(CONN_UPDATE_PENDING);
+        k_work_reschedule(&conn_update_timeout_work, CONN_UPDATE_TIMEOUT_MS);
+    }
+    /* -EALREADY: controller already has these params — no L2CAP procedure
+     * was started, so on_le_param_updated won't fire.  Skip PENDING to
+     * avoid blocking low-latency restore for the timeout duration. */
 }
 
 static void idle_check_fn(struct k_work *work) {

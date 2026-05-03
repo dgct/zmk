@@ -1173,6 +1173,7 @@ static int split_bt_invoke_behavior_payload(struct central_cmd_wrapper payload_w
     int err = k_msgq_put(&zmk_split_central_split_run_msgq, &payload_wrapper, K_NO_WAIT);
     if (err) {
         switch (err) {
+        case -ENOMSG:
         case -EAGAIN: {
             LOG_WRN("Run command message queue full, popping first message and queueing again");
             struct central_cmd_wrapper discarded_report;

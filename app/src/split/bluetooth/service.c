@@ -255,6 +255,7 @@ int send_position_state() {
     int err = k_msgq_put(&position_state_msgq, position_state, K_NO_WAIT);
     if (err) {
         switch (err) {
+        case -ENOMSG:
         case -EAGAIN: {
             LOG_WRN("Position state message queue full, popping first message and queueing again");
             uint8_t discarded_state[POS_STATE_LEN];
@@ -319,6 +320,7 @@ int send_sensor_state(struct sensor_event ev) {
     if (err) {
         // retry...
         switch (err) {
+        case -ENOMSG:
         case -EAGAIN: {
             LOG_WRN("Sensor state message queue full, popping first message and queueing again");
             struct sensor_event discarded_state;
