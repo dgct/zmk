@@ -79,6 +79,9 @@ enum {
 
 #define MAX_CI_RETRIES 3
 static uint8_t ci_retry_count;
+static uint16_t best_ci = CONFIG_ZMK_BLE_FAST_CI_INTERVAL;
+static bool explore_ci;
+static enum zmk_activity_state prev_activity_state = ZMK_ACTIVITY_ACTIVE;
 
 static struct bt_conn *active_conn;
 static uint8_t latency_state;
@@ -160,6 +163,7 @@ static void request_low_latency(void) {
         return;
     }
     if (s.state & CONN_LOW_LATENCY_ENABLED) {
+        explore_ci = false;
         k_work_reschedule(&idle_check_work, IDLE_TIMEOUT_MS);
         return;
     }
@@ -179,11 +183,16 @@ static void request_low_latency(void) {
     }
 
     int err;
-    if ((s.state & CONN_WARMUP_DONE) &&
-        info.le.interval > CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+    uint16_t ci_target = best_ci;
+    if (explore_ci) {
+        ci_target = CONFIG_ZMK_BLE_FAST_CI_INTERVAL;
+        explore_ci = false;
+        LOG_INF("ble_latency: dormant recovery, exploring CI=%u", ci_target);
+    }
+    if ((s.state & CONN_WARMUP_DONE) && info.le.interval > ci_target) {
         struct bt_le_conn_param param = {
-            .interval_min = CONFIG_ZMK_BLE_FAST_CI_INTERVAL,
-            .interval_max = CONFIG_ZMK_BLE_FAST_CI_INTERVAL,
+            .interval_min = ci_target,
+            .interval_max = ci_target,
             .latency = 0,
             .timeout = info.le.timeout,
         };
@@ -317,6 +326,9 @@ static void on_connected(struct bt_conn *conn, uint8_t err) {
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     active_conn = conn;
     latency_state = 0;
+    best_ci = CONFIG_ZMK_BLE_FAST_CI_INTERVAL;
+    ci_retry_count = 0;
+    explore_ci = false;
     k_spin_unlock(&state_lock, key);
 }
 
@@ -367,10 +379,16 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
         if (interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
             latency_state |= CONN_WARMUP_DONE;
             ci_retry_count = 0;
+            if (interval < best_ci) {
+                best_ci = interval;
+            }
         }
-        if (latency == 0 && interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+        if (latency == 0 && interval <= best_ci) {
             latency_state |= CONN_LOW_LATENCY_ENABLED;
             latency_state &= ~CONN_CI_SETTLED;
+            if (interval < best_ci) {
+                best_ci = interval;
+            }
         } else if (latency == 0) {
             /* Central granted latency=0 but at wider CI than desired.
              * Retry fast CI unless we've exhausted attempts (Apple may
@@ -381,16 +399,19 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
                 ci_retry_count++;
                 latency_state &= ~CONN_LOW_LATENCY_ENABLED;
                 restore = true;
-                LOG_INF("ble_latency: CI=%u wider than target %u, "
+                LOG_INF("ble_latency: CI=%u > best_ci=%u, "
                         "retry %u/%u", interval,
-                        CONFIG_ZMK_BLE_FAST_CI_INTERVAL,
-                        ci_retry_count, MAX_CI_RETRIES);
+                        best_ci, ci_retry_count, MAX_CI_RETRIES);
             } else {
                 /* Accept wider CI — central insists */
                 latency_state |= CONN_LOW_LATENCY_ENABLED;
                 latency_state |= CONN_CI_SETTLED;
-                LOG_INF("ble_latency: accepted CI=%u with lat=0 "
-                        "(fast CI unavailable)", interval);
+                if (!(latency_state & CONN_WARMUP_DONE)) {
+                    latency_state |= CONN_WARMUP_DONE;
+                }
+                best_ci = interval;
+                LOG_INF("ble_latency: accepted CI=%u as best_ci "
+                        "(lat=0)", interval);
             }
         } else {
             latency_state &= ~CONN_LOW_LATENCY_ENABLED;
@@ -423,6 +444,10 @@ static int activity_event_listener(const zmk_event_t *eh) {
     case ZMK_ACTIVITY_ACTIVE:
         state_clear_bit(CONN_IN_DEEP_IDLE | CONN_CI_SETTLED);
         ci_retry_count = 0;
+        if (prev_activity_state == ZMK_ACTIVITY_SLEEP &&
+            best_ci > CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+            explore_ci = true;
+        }
         request_low_latency();
         break;
     case ZMK_ACTIVITY_IDLE:
@@ -433,6 +458,7 @@ static int activity_event_listener(const zmk_event_t *eh) {
     case ZMK_ACTIVITY_SLEEP:
         break;
     }
+    prev_activity_state = ev->state;
     return ZMK_EV_EVENT_BUBBLE;
 }
 
