@@ -373,9 +373,33 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
                                 uint16_t timeout) {
     ARG_UNUSED(timeout);
     bool restore = false;
+    bool was_pending = false;
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     if (conn == active_conn) {
+        was_pending = !!(latency_state & CONN_UPDATE_PENDING);
         latency_state &= ~CONN_UPDATE_PENDING;
+
+        if (!was_pending) {
+            /* External param change (e.g. subrating dormant host params,
+             * or host-initiated renegotiation). Update tracking state
+             * but don't trigger CI retry logic — we didn't request this. */
+            if (latency == 0) {
+                latency_state |= CONN_LOW_LATENCY_ENABLED;
+            } else {
+                latency_state &= ~CONN_LOW_LATENCY_ENABLED;
+            }
+            if (interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+                latency_state |= CONN_WARMUP_DONE;
+                if (interval < best_ci) {
+                    best_ci = interval;
+                }
+            }
+            k_spin_unlock(&state_lock, key);
+            LOG_INF("ble_latency: external param change "
+                    "(CI=%u, lat=%u) — no action", interval, latency);
+            return;
+        }
+
         if (interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
             latency_state |= CONN_WARMUP_DONE;
             ci_retry_count = 0;
@@ -422,7 +446,9 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
         }
     }
     k_spin_unlock(&state_lock, key);
-    k_work_cancel_delayable(&conn_update_timeout_work);
+    if (was_pending) {
+        k_work_cancel_delayable(&conn_update_timeout_work);
+    }
     if (restore) {
         request_low_latency();
     }
