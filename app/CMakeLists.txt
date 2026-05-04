@@ -39,6 +39,7 @@ target_sources_ifdef(CONFIG_ZMK_GPIO_KEY_WAKEUP_TRIGGER app PRIVATE src/gpio_key
 target_sources_ifdef(CONFIG_ZMK_CONSTLAT app PRIVATE src/constlat.c)
 target_sources_ifdef(CONFIG_ZMK_HFCLK_LOCK app PRIVATE src/hfclk_lock.c)
 target_sources(app PRIVATE src/events/activity_state_changed.c)
+target_sources_ifdef(CONFIG_ZMK_BLE_DYNAMIC_HID_LATENCY app PRIVATE src/events/ble_host_param_request.c)
 target_sources(app PRIVATE src/events/position_state_changed.c)
 target_sources(app PRIVATE src/events/sensor_event.c)
 target_sources_ifdef(CONFIG_ZMK_WPM app PRIVATE src/events/wpm_state_changed.c)

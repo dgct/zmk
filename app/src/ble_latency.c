@@ -52,6 +52,7 @@
 #include <zmk/ble.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/activity_state_changed.h>
+#include <zmk/events/ble_host_param_request.h>
 #include <zmk/events/keycode_state_changed.h>
 #include <zmk/events/position_state_changed.h>
 
@@ -373,33 +374,9 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
                                 uint16_t timeout) {
     ARG_UNUSED(timeout);
     bool restore = false;
-    bool was_pending = false;
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     if (conn == active_conn) {
-        was_pending = !!(latency_state & CONN_UPDATE_PENDING);
         latency_state &= ~CONN_UPDATE_PENDING;
-
-        if (!was_pending) {
-            /* External param change (e.g. subrating dormant host params,
-             * or host-initiated renegotiation). Update tracking state
-             * but don't trigger CI retry logic — we didn't request this. */
-            if (latency == 0) {
-                latency_state |= CONN_LOW_LATENCY_ENABLED;
-            } else {
-                latency_state &= ~CONN_LOW_LATENCY_ENABLED;
-            }
-            if (interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
-                latency_state |= CONN_WARMUP_DONE;
-                if (interval < best_ci) {
-                    best_ci = interval;
-                }
-            }
-            k_spin_unlock(&state_lock, key);
-            LOG_INF("ble_latency: external param change "
-                    "(CI=%u, lat=%u) — no action", interval, latency);
-            return;
-        }
-
         if (interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
             latency_state |= CONN_WARMUP_DONE;
             ci_retry_count = 0;
@@ -446,9 +423,7 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
         }
     }
     k_spin_unlock(&state_lock, key);
-    if (was_pending) {
-        k_work_cancel_delayable(&conn_update_timeout_work);
-    }
+    k_work_cancel_delayable(&conn_update_timeout_work);
     if (restore) {
         request_low_latency();
     }
@@ -518,6 +493,69 @@ static void ble_latency_input_listener(struct input_event *ev, void *user_data) 
 }
 INPUT_CALLBACK_DEFINE(NULL, ble_latency_input_listener, NULL);
 #endif
+
+/*
+ * Host param request listener — single-writer interface for external modules
+ * (e.g. subrating dormant) that need to change host connection parameters.
+ * All host link param updates flow through ble_latency's state machine.
+ */
+static int host_param_request_listener(const zmk_event_t *eh) {
+    const struct zmk_ble_host_param_request *req = as_zmk_ble_host_param_request(eh);
+    if (!req) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    if (req->restore) {
+        /* Caller wants us to restore our preferred params. If we're in
+         * deep idle, request_idle_2 would re-apply deep-idle params.
+         * If active, request_low_latency restores fast CI + lat=0. */
+        struct snapshot s = take_snapshot();
+        if (!s.conn || !(s.state & CONN_IS_SECURED)) {
+            return ZMK_EV_EVENT_BUBBLE;
+        }
+        if (s.state & CONN_IN_DEEP_IDLE) {
+            request_idle_2();
+        } else {
+            request_low_latency();
+        }
+        LOG_INF("ble_latency: host param restore requested");
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    struct snapshot s = take_snapshot();
+    if (!s.conn || !(s.state & CONN_IS_SECURED)) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+    if (s.state & CONN_UPDATE_PENDING) {
+        /* Another update is in flight — log and skip. The dormant timer
+         * will fire again or the caller can retry. */
+        LOG_WRN("ble_latency: host param request dropped (update pending)");
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    struct bt_le_conn_param param = {
+        .interval_min = req->interval_min,
+        .interval_max = req->interval_max,
+        .latency = req->latency,
+        .timeout = req->timeout,
+    };
+
+    int err = bt_conn_le_param_update(s.conn, &param);
+    if (err == 0) {
+        state_set_bit(CONN_UPDATE_PENDING);
+        k_work_reschedule(&conn_update_timeout_work, CONN_UPDATE_TIMEOUT_MS);
+        LOG_INF("ble_latency: host param request applied "
+                "(CI=%u-%u, lat=%u)", req->interval_min,
+                req->interval_max, req->latency);
+    } else if (err != -EALREADY) {
+        LOG_WRN("ble_latency: host param request failed (%d)", err);
+    }
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(ble_latency_host_param, host_param_request_listener);
+ZMK_SUBSCRIPTION(ble_latency_host_param, zmk_ble_host_param_request);
 
 static int ble_latency_init(void) {
     k_work_init_delayable(&idle_check_work, idle_check_fn);
