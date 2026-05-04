@@ -74,7 +74,11 @@ enum {
     CONN_IN_DEEP_IDLE = BIT(3),
     CONN_UPDATE_PENDING = BIT(4),
     CONN_WARMUP_DONE = BIT(5),
+    CONN_CI_SETTLED = BIT(6),
 };
+
+#define MAX_CI_RETRIES 3
+static uint8_t ci_retry_count;
 
 static struct bt_conn *active_conn;
 static uint8_t latency_state;
@@ -362,9 +366,32 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
         latency_state &= ~CONN_UPDATE_PENDING;
         if (interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
             latency_state |= CONN_WARMUP_DONE;
+            ci_retry_count = 0;
         }
-        if (latency == 0) {
+        if (latency == 0 && interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
             latency_state |= CONN_LOW_LATENCY_ENABLED;
+            latency_state &= ~CONN_CI_SETTLED;
+        } else if (latency == 0) {
+            /* Central granted latency=0 but at wider CI than desired.
+             * Retry fast CI unless we've exhausted attempts (Apple may
+             * persistently refuse the aggressive interval). */
+            if (ci_retry_count < MAX_CI_RETRIES &&
+                (latency_state & CONN_WARMUP_DONE) &&
+                !(latency_state & CONN_CI_SETTLED)) {
+                ci_retry_count++;
+                latency_state &= ~CONN_LOW_LATENCY_ENABLED;
+                restore = true;
+                LOG_INF("ble_latency: CI=%u wider than target %u, "
+                        "retry %u/%u", interval,
+                        CONFIG_ZMK_BLE_FAST_CI_INTERVAL,
+                        ci_retry_count, MAX_CI_RETRIES);
+            } else {
+                /* Accept wider CI — central insists */
+                latency_state |= CONN_LOW_LATENCY_ENABLED;
+                latency_state |= CONN_CI_SETTLED;
+                LOG_INF("ble_latency: accepted CI=%u with lat=0 "
+                        "(fast CI unavailable)", interval);
+            }
         } else {
             latency_state &= ~CONN_LOW_LATENCY_ENABLED;
         }
@@ -394,7 +421,8 @@ static int activity_event_listener(const zmk_event_t *eh) {
     }
     switch (ev->state) {
     case ZMK_ACTIVITY_ACTIVE:
-        state_clear_bit(CONN_IN_DEEP_IDLE);
+        state_clear_bit(CONN_IN_DEEP_IDLE | CONN_CI_SETTLED);
+        ci_retry_count = 0;
         request_low_latency();
         break;
     case ZMK_ACTIVITY_IDLE:
