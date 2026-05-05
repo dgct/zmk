@@ -86,13 +86,55 @@ static bool explore_ci;
 static enum zmk_activity_state prev_activity_state = ZMK_ACTIVITY_ACTIVE;
 
 static struct bt_conn *active_conn;
-static struct bt_conn *background_conn; /* non-active-profile host connection */
+static struct bt_conn *bg_conns[CONFIG_BT_MAX_CONN]; /* non-active-profile host connections */
 static uint8_t latency_state;
 static struct k_spinlock state_lock;
 static struct k_work_delayable idle_check_work;
 static struct k_work_delayable warmup_work;
 static struct k_work_delayable conn_update_timeout_work;
 static struct k_work background_idle_work;
+
+/* Background connection helpers — caller must hold state_lock. */
+static bool bg_add(struct bt_conn *conn) {
+    for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+        if (!bg_conns[i]) {
+            bg_conns[i] = conn;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool bg_remove(struct bt_conn *conn) {
+    for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+        if (bg_conns[i] == conn) {
+            bg_conns[i] = NULL;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool bg_contains(struct bt_conn *conn) {
+    for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+        if (bg_conns[i] == conn) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Find a background connection matching a BLE address. Returns the conn
+ * pointer (NOT ref-incremented) or NULL. Caller must hold state_lock. */
+static struct bt_conn *bg_find_by_addr(const bt_addr_le_t *addr) {
+    for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+        if (bg_conns[i] &&
+            !bt_addr_le_cmp(bt_conn_get_dst(bg_conns[i]), addr)) {
+            return bg_conns[i];
+        }
+    }
+    return NULL;
+}
 
 struct snapshot {
     struct bt_conn *conn;
@@ -317,18 +359,15 @@ static void warmup_fn(struct k_work *work) {
 }
 
 /*
- * Push a background (non-active-profile) connection to deep-idle parameters
- * so it doesn't waste radio time. Runs from the system workqueue.
+ * Push all background (non-active-profile) connections to deep-idle parameters
+ * so they don't waste radio time. Runs from the system workqueue.
  */
 static void background_idle_work_fn(struct k_work *work) {
     ARG_UNUSED(work);
-    struct bt_conn *conn;
+    struct bt_conn *conns[CONFIG_BT_MAX_CONN];
     k_spinlock_key_t key = k_spin_lock(&state_lock);
-    conn = background_conn;
+    memcpy(conns, bg_conns, sizeof(conns));
     k_spin_unlock(&state_lock, key);
-    if (!conn) {
-        return;
-    }
 
     uint16_t interval_units =
         BT_GAP_MS_TO_CONN_INTERVAL(CONFIG_ZMK_BLE_DEEP_IDLE_INTERVAL_MS);
@@ -339,11 +378,16 @@ static void background_idle_work_fn(struct k_work *work) {
         .timeout = CONFIG_ZMK_BLE_DEEP_IDLE_TIMEOUT_S * 100,
     };
 
-    int err = bt_conn_le_param_update(conn, &param);
-    if (err && err != -EALREADY) {
-        LOG_WRN("ble_latency: background idle push failed (%d)", err);
-    } else {
-        LOG_INF("ble_latency: background conn pushed to deep idle");
+    for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+        if (!conns[i]) {
+            continue;
+        }
+        int err = bt_conn_le_param_update(conns[i], &param);
+        if (err && err != -EALREADY) {
+            LOG_WRN("ble_latency: bg[%d] idle push failed (%d)", i, err);
+        } else {
+            LOG_INF("ble_latency: bg[%d] pushed to deep idle", i);
+        }
     }
 }
 
@@ -376,13 +420,14 @@ static void on_connected(struct bt_conn *conn, uint8_t err) {
         ci_retry_count = 0;
         explore_ci = false;
     } else {
-        background_conn = conn;
+        bg_add(conn);
     }
     k_spin_unlock(&state_lock, key);
 
     if (!is_active) {
-        /* Push background connection to deep idle after security settles.
-         * Use a short delay to let encryption complete first. */
+        /* Background connections get pushed to deep idle once encryption
+         * completes (on_security_changed). Also submit here as a fallback
+         * in case the connection is already encrypted (reconnection). */
         k_work_submit(&background_idle_work);
     }
 }
@@ -395,8 +440,8 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
         active_conn = NULL;
         latency_state = 0;
         was_active = true;
-    } else if (conn == background_conn) {
-        background_conn = NULL;
+    } else {
+        bg_remove(conn);
     }
     k_spin_unlock(&state_lock, key);
     if (was_active) {
@@ -414,7 +459,7 @@ static void on_security_changed(struct bt_conn *conn, bt_security_t level,
     if (conn == active_conn && !err && level >= BT_SECURITY_L2) {
         latency_state |= CONN_IS_SECURED;
         armed = true;
-    } else if (conn == background_conn && !err && level >= BT_SECURITY_L2) {
+    } else if (!err && level >= BT_SECURITY_L2 && bg_contains(conn)) {
         push_bg = true;
     }
     k_spin_unlock(&state_lock, key);
@@ -554,14 +599,18 @@ static int profile_changed_listener(const zmk_event_t *eh) {
 
     k_spinlock_key_t key = k_spin_lock(&state_lock);
 
-    /* If the new active profile's connection is currently in the background
-     * slot, swap it to active. The old active becomes background. */
-    if (new_active_profile_conn && background_conn &&
-        !bt_addr_le_cmp(bt_conn_get_dst(background_conn),
-                        bt_conn_get_dst(new_active_profile_conn))) {
-        struct bt_conn *old_active = active_conn;
-        active_conn = background_conn;
-        background_conn = old_active;
+    /* If the new active profile's connection is currently in a background
+     * slot, swap it to active. The old active goes to background. */
+    struct bt_conn *found_bg = NULL;
+    if (new_active_profile_conn) {
+        found_bg = bg_find_by_addr(bt_conn_get_dst(new_active_profile_conn));
+    }
+    if (found_bg) {
+        bg_remove(found_bg);
+        if (active_conn) {
+            bg_add(active_conn);
+        }
+        active_conn = found_bg;
         latency_state = 0;
         best_ci = CONFIG_ZMK_BLE_FAST_CI_INTERVAL;
         ci_retry_count = 0;
@@ -572,7 +621,7 @@ static int profile_changed_listener(const zmk_event_t *eh) {
                               bt_conn_get_dst(new_active_profile_conn))) {
         /* Active conn doesn't match new profile and isn't in background
          * — demote it to background. */
-        background_conn = active_conn;
+        bg_add(active_conn);
         active_conn = NULL;
         latency_state = 0;
         swapped = true;
@@ -585,7 +634,7 @@ static int profile_changed_listener(const zmk_event_t *eh) {
     }
 
     if (swapped) {
-        LOG_INF("ble_latency: profile switch — swapped active/background");
+        LOG_INF("ble_latency: profile switch — reslotted active/background");
         k_work_cancel_delayable(&idle_check_work);
         k_work_cancel_delayable(&warmup_work);
         k_work_cancel_delayable(&conn_update_timeout_work);
