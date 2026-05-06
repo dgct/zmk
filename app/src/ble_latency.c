@@ -59,6 +59,15 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+/*
+ * SDC LLPM interval encoding: the SoftDevice Controller encodes sub-7.5ms
+ * (vendor-specific LLPM) connection intervals with the 0x0d00 bitmask in
+ * the interval field.  E.g. 1ms CI = 0x0d01.  These values are NOT valid
+ * for standard L2CAP Connection Parameter Update and must be recognized
+ * throughout the CI comparison logic.
+ */
+#define BLE_INTERVAL_IS_LLPM(interval) (!!((interval) & 0x0d00))
+
 #define IDLE_TIMEOUT_MS K_MSEC(CONFIG_ZMK_BLE_HID_IDLE_TIMEOUT_MS)
 
 BUILD_ASSERT(
@@ -77,6 +86,12 @@ enum {
     CONN_UPDATE_PENDING = BIT(4),
     CONN_WARMUP_DONE = BIT(5),
     CONN_CI_SETTLED = BIT(6),
+    CONN_CI_REQUEST_PENDING = BIT(10), /* a CI-changing request is in-flight
+                                        * (warmup or retry), as opposed to a
+                                        * latency-only update.  Used to
+                                        * distinguish central-initiated param
+                                        * updates from responses to our CI
+                                        * negotiation attempts. */
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
     CONN_SUBRATING_PROBED = BIT(7),    /* subrate_request sent at least once */
     CONN_SUBRATING_SUPPORTED = BIT(8), /* host accepted subrating */
@@ -259,6 +274,22 @@ static struct bt_conn *bg_find_by_addr(const bt_addr_le_t *addr) {
     return NULL;
 }
 
+/*
+ * Reset CI negotiation state to initial values.  Called when a connection
+ * assumes the active slot (new connect or profile switch).  Caller must
+ * hold state_lock.
+ *
+ * This is the single authoritative "memory clear" for the CI state machine.
+ * All negotiation memory (target, retries, phase flags) resets so the new
+ * connection starts from a clean slate: warm up → negotiate → settle.
+ */
+static void reset_ci_negotiation(void) {
+    latency_state = 0;
+    best_ci = CONFIG_ZMK_BLE_FAST_CI_INTERVAL;
+    ci_retry_count = 0;
+    explore_ci = false;
+}
+
 struct snapshot {
     struct bt_conn *conn;
     uint16_t state;
@@ -280,7 +311,7 @@ static void conn_update_timeout_fn(struct k_work *work) {
     bool was_pending = false;
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     if (latency_state & CONN_UPDATE_PENDING) {
-        latency_state &= ~CONN_UPDATE_PENDING;
+        latency_state &= ~(CONN_UPDATE_PENDING | CONN_CI_REQUEST_PENDING);
         was_pending = true;
         LOG_WRN("ble_latency: conn param update timed out (L2CAP rejection?)");
     }
@@ -300,6 +331,12 @@ static int update_latency_only(struct bt_conn *conn, uint16_t new_latency) {
     if (err) {
         LOG_WRN("ble_latency: bt_conn_get_info failed (%d)", err);
         return err;
+    }
+
+    /* At LLPM CI (1ms), peripheral latency is meaningless and the
+     * vendor-specific interval encoding isn't valid for L2CAP. */
+    if (BLE_INTERVAL_IS_LLPM(info.le.interval)) {
+        return -EALREADY;
     }
 
     /* info.le.interval is already in 1.25ms units — the same units that
@@ -361,7 +398,8 @@ static void request_low_latency(void) {
         explore_ci = false;
         LOG_INF("ble_latency: dormant recovery, exploring CI=%u", ci_target);
     }
-    if ((s.state & CONN_WARMUP_DONE) && info.le.interval > ci_target) {
+    if ((s.state & CONN_WARMUP_DONE) && !BLE_INTERVAL_IS_LLPM(info.le.interval) &&
+        info.le.interval > ci_target) {
         struct bt_le_conn_param param = {
             .interval_min = ci_target,
             .interval_max = ci_target,
@@ -369,6 +407,9 @@ static void request_low_latency(void) {
             .timeout = info.le.timeout,
         };
         err = bt_conn_le_param_update(s.conn, &param);
+        if (err == 0) {
+            state_set_bit(CONN_CI_REQUEST_PENDING);
+        }
     } else {
         err = update_latency_only(s.conn, 0);
     }
@@ -473,8 +514,9 @@ static void warmup_fn(struct k_work *work) {
         return;
     }
 
-    if (info.le.interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
-        /* Host already chose a fast CI (e.g. Windows/Linux) — skip. */
+    if (BLE_INTERVAL_IS_LLPM(info.le.interval) ||
+        info.le.interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+        /* Host already chose a fast CI (or LLPM is active) — skip. */
         state_set_bit(CONN_WARMUP_DONE);
         return;
     }
@@ -494,7 +536,7 @@ static void warmup_fn(struct k_work *work) {
 
     int err = bt_conn_le_param_update(s.conn, &param);
     if (err == 0) {
-        state_set_bit(CONN_UPDATE_PENDING);
+        state_set_bit(CONN_UPDATE_PENDING | CONN_CI_REQUEST_PENDING);
         k_work_reschedule(&conn_update_timeout_work, CONN_UPDATE_TIMEOUT_MS);
     } else if (err == -EALREADY) {
         k_work_reschedule(&warmup_work, K_MSEC(500));
@@ -560,10 +602,7 @@ static void on_connected(struct bt_conn *conn, uint8_t err) {
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     if (is_active) {
         active_conn = conn;
-        latency_state = 0;
-        best_ci = CONFIG_ZMK_BLE_FAST_CI_INTERVAL;
-        ci_retry_count = 0;
-        explore_ci = false;
+        reset_ci_negotiation();
     } else {
         bg_add(conn);
     }
@@ -583,7 +622,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     if (conn == active_conn) {
         active_conn = NULL;
-        latency_state = 0;
+        reset_ci_negotiation();
         was_active = true;
     } else {
         bg_remove(conn);
@@ -648,43 +687,82 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
     bool restore = false;
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     if (conn == active_conn) {
-        latency_state &= ~CONN_UPDATE_PENDING;
-        if (interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+        /* Track whether this is a response to a CI-changing request
+         * (warmup or retry) vs a central-initiated update or latency-only
+         * change.  Critical for CI memory: we must not settle best_ci on
+         * an unsolicited central update before warmup has negotiated. */
+        bool was_ci_request = !!(latency_state & CONN_CI_REQUEST_PENDING);
+        latency_state &= ~(CONN_UPDATE_PENDING | CONN_CI_REQUEST_PENDING);
+
+        /* LLPM intervals (sub-7.5ms, vendor-specific encoding) are
+         * better than our target — treat as optimal CI achieved. */
+        bool is_llpm = BLE_INTERVAL_IS_LLPM(interval);
+
+        if (is_llpm || interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+            /* Fast or LLPM CI achieved — warmup phase complete. */
             latency_state |= CONN_WARMUP_DONE;
             ci_retry_count = 0;
-            if (interval < best_ci) {
+            if (!is_llpm && interval < best_ci) {
                 best_ci = interval;
             }
         }
-        if (latency == 0 && interval <= best_ci) {
+        if (latency == 0 && (is_llpm || interval <= best_ci)) {
+            /* At or better than our target CI with lat=0 — optimal. */
             latency_state |= CONN_LOW_LATENCY_ENABLED;
             latency_state &= ~CONN_CI_SETTLED;
-            if (interval < best_ci) {
+            if (!is_llpm && interval < best_ci) {
                 best_ci = interval;
             }
         } else if (latency == 0) {
             /* Central granted latency=0 but at wider CI than desired.
-             * Retry fast CI unless we've exhausted attempts (Apple may
-             * persistently refuse the aggressive interval). */
+             *
+             * Decision tree (mirrors Request→Confirm→Settle pattern):
+             *   1. WARMUP_DONE + retries left → retry fast CI
+             *   2. !WARMUP_DONE + was_our_request → warmup attempt
+             *      completed but central chose wider; transition to
+             *      post-warmup state and retry on next keystroke.
+             *   3. !WARMUP_DONE + !was_our_request → central-initiated
+             *      update before warmup; accept temporarily, don't
+             *      pollute best_ci or advance state.
+             *   4. Retries exhausted or CI_SETTLED → settle.
+             */
             if (ci_retry_count < MAX_CI_RETRIES &&
                 (latency_state & CONN_WARMUP_DONE) &&
                 !(latency_state & CONN_CI_SETTLED)) {
+                /* Case 1: Post-warmup retry */
                 ci_retry_count++;
                 latency_state &= ~CONN_LOW_LATENCY_ENABLED;
                 restore = true;
                 LOG_INF("ble_latency: CI=%u > best_ci=%u, "
                         "retry %u/%u", interval,
                         best_ci, ci_retry_count, MAX_CI_RETRIES);
+            } else if (!(latency_state & CONN_WARMUP_DONE) &&
+                       was_ci_request) {
+                /* Case 2: Our warmup/CI request completed but central
+                 * chose a wider CI.  Mark warmup done so retry logic
+                 * activates on the next keystroke.  Do NOT update
+                 * best_ci — keep it at FAST_CI_INTERVAL as the target
+                 * until retries determine the true floor. */
+                latency_state |= CONN_WARMUP_DONE;
+                latency_state |= CONN_LOW_LATENCY_ENABLED;
+                LOG_INF("ble_latency: warmup got CI=%u (target=%u), "
+                        "entering retry phase", interval, best_ci);
+            } else if (!(latency_state & CONN_WARMUP_DONE)) {
+                /* Case 3: Central-initiated update before warmup
+                 * (e.g. dongle's preferred params on connect).
+                 * Accept temporarily but preserve best_ci and don't
+                 * advance state — warmup timer will negotiate. */
+                latency_state |= CONN_LOW_LATENCY_ENABLED;
+                LOG_INF("ble_latency: pre-warmup CI=%u from central "
+                        "(will renegotiate after warmup)", interval);
             } else {
-                /* Accept wider CI — central insists */
+                /* Case 4: Settle — central insists on wider CI and
+                 * retries are exhausted or CI already settled. */
                 latency_state |= CONN_LOW_LATENCY_ENABLED;
                 latency_state |= CONN_CI_SETTLED;
-                if (!(latency_state & CONN_WARMUP_DONE)) {
-                    latency_state |= CONN_WARMUP_DONE;
-                }
                 best_ci = interval;
-                LOG_INF("ble_latency: accepted CI=%u as best_ci "
-                        "(lat=0)", interval);
+                LOG_INF("ble_latency: settled CI=%u as best_ci "
+                        "(retries=%u)", interval, ci_retry_count);
             }
         } else {
             latency_state &= ~CONN_LOW_LATENCY_ENABLED;
@@ -876,10 +954,7 @@ static int profile_changed_listener(const zmk_event_t *eh) {
             bg_add(active_conn);
         }
         active_conn = found_bg;
-        latency_state = 0;
-        best_ci = CONFIG_ZMK_BLE_FAST_CI_INTERVAL;
-        ci_retry_count = 0;
-        explore_ci = false;
+        reset_ci_negotiation();
         swapped = true;
     } else if (active_conn && new_active_profile_conn &&
                bt_addr_le_cmp(bt_conn_get_dst(active_conn),
@@ -888,7 +963,7 @@ static int profile_changed_listener(const zmk_event_t *eh) {
          * — demote it to background. */
         bg_add(active_conn);
         active_conn = NULL;
-        latency_state = 0;
+        reset_ci_negotiation();
         swapped = true;
     }
 
@@ -926,6 +1001,22 @@ static int profile_changed_listener(const zmk_event_t *eh) {
                 } else {
                     state_set_bit(CONN_WARMUP_DONE);
                 }
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+                /* Re-probe subrating support — latency_state was cleared
+                 * above so CONN_SUBRATING_PROBED is unset.  Mirror the
+                 * on_security_changed probe path. */
+                if (!(latency_state & CONN_SUBRATING_PROBED)) {
+                    state_set_bit(CONN_SUBRATING_PROBED);
+                    int probe_err = host_subrate_request(s.conn,
+                                                        &host_probe_subrate);
+                    if (probe_err) {
+                        LOG_WRN("ble_latency: subrate re-probe failed (%d)",
+                                probe_err);
+                    } else {
+                        LOG_INF("ble_latency: probing host subrating support");
+                    }
+                }
+#endif
                 request_low_latency();
             }
         }
