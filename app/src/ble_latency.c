@@ -697,6 +697,9 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
         /* LLPM intervals (sub-7.5ms, vendor-specific encoding) are
          * better than our target — treat as optimal CI achieved. */
         bool is_llpm = BLE_INTERVAL_IS_LLPM(interval);
+        if (is_llpm) {
+            LOG_INF("ble_latency: LLPM active (interval=0x%04x)", interval);
+        }
 
         if (is_llpm || interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
             /* Fast or LLPM CI achieved — warmup phase complete. */
