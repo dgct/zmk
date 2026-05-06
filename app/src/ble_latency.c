@@ -194,6 +194,27 @@ static void subrate_timeout_fn(struct k_work *work) {
         k_spin_unlock(&state_lock, key);
     }
 }
+
+static int update_latency_only(struct bt_conn *conn, uint16_t new_latency);
+
+/**
+ * Apply a subrating tier: send the LL subrate request and ensure peripheral
+ * latency is zero (subrating and peripheral latency compound:
+ * effective interval = CI × factor × (1 + latency)).
+ */
+static void apply_subrate(struct bt_conn *conn,
+                          const struct bt_conn_le_subrate_param *params,
+                          const char *tier_name)
+{
+    int err = host_subrate_request(conn, params);
+    if (err && err != -EBUSY && err != -EALREADY) {
+        LOG_WRN("ble_latency: host subrate %s failed (%d)", tier_name, err);
+    }
+    struct bt_conn_info info;
+    if (!bt_conn_get_info(conn, &info) && info.le.latency > 0) {
+        update_latency_only(conn, 0);
+    }
+}
 #endif /* CONFIG_BT_SUBRATING */
 
 /* Background connection helpers — caller must hold state_lock. */
@@ -327,15 +348,7 @@ static void request_low_latency(void) {
 
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
     if (s.state & CONN_SUBRATING_SUPPORTED) {
-        err = host_subrate_request(s.conn, &host_active_subrate);
-        if (err && err != -EBUSY && err != -EALREADY) {
-            LOG_WRN("ble_latency: host subrate active failed (%d)", err);
-        }
-        /* Also restore latency=0 via param update to clear any
-         * peripheral latency that was set before subrating was probed. */
-        if (info.le.latency > 0) {
-            update_latency_only(s.conn, 0);
-        }
+        apply_subrate(s.conn, &host_active_subrate, "active");
         state_set_bit(CONN_LOW_LATENCY_ENABLED);
         k_work_reschedule(&idle_check_work, IDLE_TIMEOUT_MS);
         return;
@@ -375,16 +388,7 @@ static void request_idle_1(void) {
 
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
     if (s.state & CONN_SUBRATING_SUPPORTED) {
-        int err = host_subrate_request(s.conn, &host_idle1_subrate);
-        if (err && err != -EBUSY && err != -EALREADY) {
-            LOG_WRN("ble_latency: host subrate idle-1 failed (%d)", err);
-        }
-        /* Ensure peripheral latency is zero — subrating and peripheral
-         * latency compound (effective = CI × factor × (1+latency)). */
-        struct bt_conn_info info;
-        if (!bt_conn_get_info(s.conn, &info) && info.le.latency > 0) {
-            update_latency_only(s.conn, 0);
-        }
+        apply_subrate(s.conn, &host_idle1_subrate, "idle-1");
         state_clear_bit(CONN_LOW_LATENCY_ENABLED);
         return;
     }
@@ -406,16 +410,7 @@ static void request_idle_2(void) {
 
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
     if (s.state & CONN_SUBRATING_SUPPORTED) {
-        int err = host_subrate_request(s.conn, &host_idle2_subrate);
-        if (err && err != -EBUSY && err != -EALREADY) {
-            LOG_WRN("ble_latency: host subrate idle-2 failed (%d)", err);
-        }
-        /* Ensure peripheral latency is zero — subrating and peripheral
-         * latency compound (effective = CI × factor × (1+latency)). */
-        struct bt_conn_info info;
-        if (!bt_conn_get_info(s.conn, &info) && info.le.latency > 0) {
-            update_latency_only(s.conn, 0);
-        }
+        apply_subrate(s.conn, &host_idle2_subrate, "idle-2");
         state_clear_bit(CONN_LOW_LATENCY_ENABLED);
         return;
     }
@@ -748,9 +743,38 @@ static void on_subrate_changed(struct bt_conn *conn,
         }
     } else {
         bool already_supported = !!(latency_state & CONN_SUBRATING_SUPPORTED);
+        bool range_too_narrow = false;
         latency_state &= ~CONN_SUBRATE_PENDING;
+
+        if (already_supported &&
+            params->status == BT_HCI_ERR_UNSUPP_FEATURE_PARAM_VAL) {
+            /* Central's authorized subrate range doesn't accommodate
+             * our idle factors (e.g. central defaults subrate_max=1).
+             * factor=1 probe succeeded but factor>1 is rejected.
+             * Settle: clear SUPPORTED so subsequent tier transitions
+             * use peripheral latency.  Mirrors best_ci settle pattern.
+             * Will re-probe on next connection (latency_state resets). */
+            latency_state &= ~CONN_SUBRATING_SUPPORTED;
+            range_too_narrow = true;
+        }
+
         k_spin_unlock(&state_lock, key);
         k_work_cancel_delayable(&subrate_timeout_work);
+
+        if (range_too_narrow) {
+            LOG_WRN("ble_latency: host subrate range too narrow (0x%02x), "
+                    "falling back to peripheral latency", params->status);
+            switch (zmk_activity_get_state()) {
+            case ZMK_ACTIVITY_ACTIVE:
+                request_low_latency();
+                break;
+            case ZMK_ACTIVITY_IDLE:
+            case ZMK_ACTIVITY_SLEEP:
+                request_idle_2();
+                break;
+            }
+            return;
+        }
 
         if (already_supported) {
             /* Transient rejection (e.g. 0x17 while Mac handles another
