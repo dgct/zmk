@@ -99,6 +99,15 @@ static struct k_work_delayable conn_update_timeout_work;
 static struct k_work background_idle_work;
 
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
+/* Probe: factor=1 — zero-risk discovery of host support. */
+static const struct bt_conn_le_subrate_param host_probe_subrate = {
+    .subrate_min = 1,
+    .subrate_max = 1,
+    .max_latency = 0,
+    .continuation_number = 0,
+    .supervision_timeout = CONFIG_BT_PERIPHERAL_PREF_TIMEOUT,
+};
+
 static const struct bt_conn_le_subrate_param host_active_subrate = {
     .subrate_min = 1,
     .subrate_max = 1,
@@ -322,22 +331,7 @@ static void request_idle_1(void) {
         state_clear_bit(CONN_LOW_LATENCY_ENABLED);
         return;
     }
-    if (!(s.state & CONN_SUBRATING_PROBED)) {
-        /* First idle transition — probe host subrating support. If the
-         * host supports BLE 5.3 subrating, we'll get a subrate_changed
-         * callback with status==0 and switch to subrating mode. If not,
-         * status==0x1A (LL_UNKNOWN_RSP) and we stick with latency. */
-        state_set_bit(CONN_SUBRATING_PROBED);
-        int err = bt_conn_le_subrate_request(s.conn, &host_idle1_subrate);
-        if (err) {
-            LOG_WRN("ble_latency: host subrate probe failed (%d)", err);
-            /* Fall through to peripheral latency path */
-        } else {
-            LOG_INF("ble_latency: probing host subrating support");
-            state_clear_bit(CONN_LOW_LATENCY_ENABLED);
-            return;
-        }
-    }
+    /* Probe not yet complete — fall through to peripheral latency */
 #endif
 
     int err = update_latency_only(s.conn, CONFIG_ZMK_BLE_HID_IDLE_LATENCY_INTERVALS);
@@ -362,18 +356,7 @@ static void request_idle_2(void) {
         state_clear_bit(CONN_LOW_LATENCY_ENABLED);
         return;
     }
-    if (!(s.state & CONN_SUBRATING_PROBED)) {
-        state_set_bit(CONN_SUBRATING_PROBED);
-        int err = bt_conn_le_subrate_request(s.conn, &host_idle2_subrate);
-        if (err) {
-            LOG_WRN("ble_latency: host subrate probe failed (%d)", err);
-            /* Fall through to deep idle conn param path */
-        } else {
-            LOG_INF("ble_latency: probing host subrating support");
-            state_clear_bit(CONN_LOW_LATENCY_ENABLED);
-            return;
-        }
-    }
+    /* Probe not yet complete — fall through to legacy deep idle params */
 #endif
 
     uint16_t interval_units =
@@ -575,6 +558,21 @@ static void on_security_changed(struct bt_conn *conn, bt_security_t level,
         } else {
             state_set_bit(CONN_WARMUP_DONE);
         }
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+        /* Probe subrating support immediately with factor=1 (zero-risk).
+         * By the time the system goes idle (ZMK_IDLE_TIMEOUT), we'll
+         * already know if the host supports subrating and can use it
+         * for the idle tiers. */
+        if (!(latency_state & CONN_SUBRATING_PROBED)) {
+            state_set_bit(CONN_SUBRATING_PROBED);
+            int probe_err = bt_conn_le_subrate_request(conn, &host_probe_subrate);
+            if (probe_err) {
+                LOG_WRN("ble_latency: subrate probe failed (%d)", probe_err);
+            } else {
+                LOG_INF("ble_latency: probing host subrating support");
+            }
+        }
+#endif
     }
     if (push_bg) {
         /* Background connection just finished encryption — now safe to
@@ -662,17 +660,31 @@ static void on_subrate_changed(struct bt_conn *conn,
     }
 
     if (params->status == BT_HCI_ERR_SUCCESS) {
+        bool first_probe = !(latency_state & CONN_SUBRATING_SUPPORTED);
         latency_state |= CONN_SUBRATING_SUPPORTED;
         k_spin_unlock(&state_lock, key);
         LOG_INF("ble_latency: host subrating supported (factor=%u, cn=%u)",
                 params->factor, params->continuation_number);
+        if (first_probe) {
+            /* Probe confirmed support. Now apply the appropriate tier
+             * based on current activity state. */
+            switch (zmk_activity_get_state()) {
+            case ZMK_ACTIVITY_ACTIVE:
+                request_low_latency();
+                break;
+            case ZMK_ACTIVITY_IDLE:
+            case ZMK_ACTIVITY_SLEEP:
+                request_idle_2();
+                break;
+            }
+        }
     } else {
         /* Host doesn't support subrating (0x1A = LL_UNKNOWN_RSP).
          * Fall back to peripheral latency — never probe again. */
         k_spin_unlock(&state_lock, key);
         LOG_WRN("ble_latency: host subrating unsupported (0x%02x), "
                 "using peripheral latency", params->status);
-        /* Apply the idle params that we skipped during the probe */
+        /* Apply the idle params we deferred while waiting for the probe */
         if (zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE) {
             request_idle_1();
         } else {
