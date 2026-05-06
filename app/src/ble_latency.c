@@ -77,6 +77,10 @@ enum {
     CONN_UPDATE_PENDING = BIT(4),
     CONN_WARMUP_DONE = BIT(5),
     CONN_CI_SETTLED = BIT(6),
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+    CONN_SUBRATING_PROBED = BIT(7),    /* subrate_request sent at least once */
+    CONN_SUBRATING_SUPPORTED = BIT(8), /* host accepted subrating */
+#endif
 };
 
 #define MAX_CI_RETRIES 3
@@ -87,12 +91,38 @@ static enum zmk_activity_state prev_activity_state = ZMK_ACTIVITY_ACTIVE;
 
 static struct bt_conn *active_conn;
 static struct bt_conn *bg_conns[CONFIG_BT_MAX_CONN]; /* non-active-profile host connections */
-static uint8_t latency_state;
+static uint16_t latency_state;
 static struct k_spinlock state_lock;
 static struct k_work_delayable idle_check_work;
 static struct k_work_delayable warmup_work;
 static struct k_work_delayable conn_update_timeout_work;
 static struct k_work background_idle_work;
+
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+static const struct bt_conn_le_subrate_param host_active_subrate = {
+    .subrate_min = 1,
+    .subrate_max = 1,
+    .max_latency = 0,
+    .continuation_number = 0,
+    .supervision_timeout = CONFIG_BT_PERIPHERAL_PREF_TIMEOUT,
+};
+
+static const struct bt_conn_le_subrate_param host_idle1_subrate = {
+    .subrate_min = 1,
+    .subrate_max = 8,
+    .max_latency = 0,
+    .continuation_number = 7,
+    .supervision_timeout = CONFIG_BT_PERIPHERAL_PREF_TIMEOUT,
+};
+
+static const struct bt_conn_le_subrate_param host_idle2_subrate = {
+    .subrate_min = 1,
+    .subrate_max = 80,
+    .max_latency = 0,
+    .continuation_number = 20,
+    .supervision_timeout = CONFIG_ZMK_BLE_DEEP_IDLE_TIMEOUT_S * 100,
+};
+#endif /* CONFIG_BT_SUBRATING */
 
 /* Background connection helpers — caller must hold state_lock. */
 static bool bg_add(struct bt_conn *conn) {
@@ -138,7 +168,7 @@ static struct bt_conn *bg_find_by_addr(const bt_addr_le_t *addr) {
 
 struct snapshot {
     struct bt_conn *conn;
-    uint8_t state;
+    uint16_t state;
 };
 
 static struct snapshot take_snapshot(void) {
@@ -150,13 +180,13 @@ static struct snapshot take_snapshot(void) {
     return s;
 }
 
-static void state_set_bit(uint8_t bit) {
+static void state_set_bit(uint16_t bit) {
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     latency_state |= bit;
     k_spin_unlock(&state_lock, key);
 }
 
-static void state_clear_bit(uint8_t bit) {
+static void state_clear_bit(uint16_t bit) {
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     latency_state &= ~bit;
     k_spin_unlock(&state_lock, key);
@@ -229,6 +259,24 @@ static void request_low_latency(void) {
     }
 
     int err;
+
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+    if (s.state & CONN_SUBRATING_SUPPORTED) {
+        err = bt_conn_le_subrate_request(s.conn, &host_active_subrate);
+        if (err && err != -EALREADY) {
+            LOG_WRN("ble_latency: host subrate active failed (%d)", err);
+        }
+        /* Also restore latency=0 via param update to clear any
+         * peripheral latency that was set before subrating was probed. */
+        if (info.le.latency > 0) {
+            update_latency_only(s.conn, 0);
+        }
+        state_set_bit(CONN_LOW_LATENCY_ENABLED);
+        k_work_reschedule(&idle_check_work, IDLE_TIMEOUT_MS);
+        return;
+    }
+#endif
+
     uint16_t ci_target = best_ci;
     if (explore_ci) {
         ci_target = CONFIG_ZMK_BLE_FAST_CI_INTERVAL;
@@ -259,6 +307,34 @@ static void request_idle_1(void) {
     if (!s.conn || !(s.state & CONN_IS_SECURED) || (s.state & CONN_UPDATE_PENDING)) {
         return;
     }
+
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+    if (s.state & CONN_SUBRATING_SUPPORTED) {
+        int err = bt_conn_le_subrate_request(s.conn, &host_idle1_subrate);
+        if (err && err != -EALREADY) {
+            LOG_WRN("ble_latency: host subrate idle-1 failed (%d)", err);
+        }
+        state_clear_bit(CONN_LOW_LATENCY_ENABLED);
+        return;
+    }
+    if (!(s.state & CONN_SUBRATING_PROBED)) {
+        /* First idle transition — probe host subrating support. If the
+         * host supports BLE 5.3 subrating, we'll get a subrate_changed
+         * callback with status==0 and switch to subrating mode. If not,
+         * status==0x1A (LL_UNKNOWN_RSP) and we stick with latency. */
+        state_set_bit(CONN_SUBRATING_PROBED);
+        int err = bt_conn_le_subrate_request(s.conn, &host_idle1_subrate);
+        if (err) {
+            LOG_WRN("ble_latency: host subrate probe failed (%d)", err);
+            /* Fall through to peripheral latency path */
+        } else {
+            LOG_INF("ble_latency: probing host subrating support");
+            state_clear_bit(CONN_LOW_LATENCY_ENABLED);
+            return;
+        }
+    }
+#endif
+
     int err = update_latency_only(s.conn, CONFIG_ZMK_BLE_HID_IDLE_LATENCY_INTERVALS);
     if (err == 0) {
         state_set_bit(CONN_UPDATE_PENDING);
@@ -271,6 +347,17 @@ static void request_idle_2(void) {
     if (!s.conn || !(s.state & CONN_IS_SECURED) || (s.state & CONN_UPDATE_PENDING)) {
         return;
     }
+
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+    if (s.state & CONN_SUBRATING_SUPPORTED) {
+        int err = bt_conn_le_subrate_request(s.conn, &host_idle2_subrate);
+        if (err && err != -EALREADY) {
+            LOG_WRN("ble_latency: host subrate idle-2 failed (%d)", err);
+        }
+        state_clear_bit(CONN_LOW_LATENCY_ENABLED);
+        return;
+    }
+#endif
 
     uint16_t interval_units =
         BT_GAP_MS_TO_CONN_INTERVAL(CONFIG_ZMK_BLE_DEEP_IDLE_INTERVAL_MS);
@@ -538,11 +625,50 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
     }
 }
 
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+static void on_subrate_changed(struct bt_conn *conn,
+                               const struct bt_conn_le_subrate_changed *params)
+{
+    struct bt_conn_info info;
+    if (bt_conn_get_info(conn, &info)) {
+        return;
+    }
+    /* Only handle peripheral-role (host link) connections */
+    if (info.role != BT_CONN_ROLE_PERIPHERAL) {
+        return;
+    }
+
+    k_spinlock_key_t key = k_spin_lock(&state_lock);
+    if (conn != active_conn) {
+        k_spin_unlock(&state_lock, key);
+        return;
+    }
+
+    if (params->status == BT_HCI_ERR_SUCCESS) {
+        latency_state |= CONN_SUBRATING_SUPPORTED;
+        k_spin_unlock(&state_lock, key);
+        LOG_INF("ble_latency: host subrating supported (factor=%u, cn=%u)",
+                params->factor, params->continuation_number);
+    } else {
+        /* Host doesn't support subrating (0x1A = LL_UNKNOWN_RSP).
+         * Fall back to peripheral latency — never probe again. */
+        k_spin_unlock(&state_lock, key);
+        LOG_WRN("ble_latency: host subrating unsupported (0x%02x), "
+                "using peripheral latency", params->status);
+        /* Apply the idle-1 latency that we skipped during the probe */
+        request_idle_1();
+    }
+}
+#endif /* CONFIG_BT_SUBRATING */
+
 BT_CONN_CB_DEFINE(ble_latency_conn_cb) = {
     .connected = on_connected,
     .disconnected = on_disconnected,
     .security_changed = on_security_changed,
     .le_param_updated = on_le_param_updated,
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+    .subrate_changed = on_subrate_changed,
+#endif
 };
 
 static int activity_event_listener(const zmk_event_t *eh) {
@@ -710,6 +836,14 @@ static int host_param_request_listener(const zmk_event_t *eh) {
         if (!s.conn || !(s.state & CONN_IS_SECURED)) {
             return ZMK_EV_EVENT_BUBBLE;
         }
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+        if (s.state & CONN_SUBRATING_SUPPORTED) {
+            /* Subrating handles event spacing — snap to factor=1 */
+            bt_conn_le_subrate_request(s.conn, &host_active_subrate);
+            LOG_INF("ble_latency: host subrate restore (factor=1)");
+            return ZMK_EV_EVENT_BUBBLE;
+        }
+#endif
         if (s.state & CONN_IN_DEEP_IDLE) {
             request_idle_2();
         } else {
@@ -723,6 +857,15 @@ static int host_param_request_listener(const zmk_event_t *eh) {
     if (!s.conn || !(s.state & CONN_IS_SECURED)) {
         return ZMK_EV_EVENT_BUBBLE;
     }
+
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+    if (s.state & CONN_SUBRATING_SUPPORTED) {
+        /* Subrating already controls event spacing on this link.
+         * The dormant CI change is unnecessary — skip it. */
+        LOG_INF("ble_latency: host param request skipped (subrating active)");
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+#endif
     if (s.state & CONN_UPDATE_PENDING) {
         /* Another update is in flight — log and skip. The dormant timer
          * will fire again or the caller can retry. */
