@@ -80,6 +80,7 @@ enum {
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
     CONN_SUBRATING_PROBED = BIT(7),    /* subrate_request sent at least once */
     CONN_SUBRATING_SUPPORTED = BIT(8), /* host accepted subrating */
+    CONN_SUBRATE_PENDING = BIT(9),     /* subrate request in-flight (awaiting callback) */
 #endif
 };
 
@@ -98,7 +99,25 @@ static struct k_work_delayable warmup_work;
 static struct k_work_delayable conn_update_timeout_work;
 static struct k_work background_idle_work;
 
+static void state_set_bit(uint16_t bit) {
+    k_spinlock_key_t key = k_spin_lock(&state_lock);
+    latency_state |= bit;
+    k_spin_unlock(&state_lock, key);
+}
+
+static void state_clear_bit(uint16_t bit) {
+    k_spinlock_key_t key = k_spin_lock(&state_lock);
+    latency_state &= ~bit;
+    k_spin_unlock(&state_lock, key);
+}
+
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
+static struct k_work_delayable subrate_timeout_work;
+/* LL subrate procedure timeout (BT spec: 40s max for LL procedure, but
+ * the SDC typically resolves in <1s.  Use 2s as a safety net — if the
+ * callback never fires, clear PENDING so the state machine doesn't jam.) */
+#define SUBRATE_TIMEOUT_MS K_MSEC(2000)
+
 /* Probe: factor=1 — zero-risk discovery of host support. */
 static const struct bt_conn_le_subrate_param host_probe_subrate = {
     .subrate_min = 1,
@@ -131,6 +150,50 @@ static const struct bt_conn_le_subrate_param host_idle2_subrate = {
     .continuation_number = 20,
     .supervision_timeout = CONFIG_ZMK_BLE_DEEP_IDLE_TIMEOUT_S * 100,
 };
+
+/**
+ * Send a subrate request with in-flight guard.
+ *
+ * Mirrors the CONN_UPDATE_PENDING pattern used for L2CAP param updates:
+ * only one subrate LL procedure can be in-flight at a time.  If a request
+ * is already pending, this returns -EBUSY without touching the controller.
+ * On success (HCI command queued), sets CONN_SUBRATE_PENDING and arms a
+ * 2s timeout; the on_subrate_changed callback clears both.
+ *
+ * Returns: 0 on success, -EBUSY if already pending, or HCI error.
+ */
+static int host_subrate_request(struct bt_conn *conn,
+                                const struct bt_conn_le_subrate_param *params)
+{
+    k_spinlock_key_t key = k_spin_lock(&state_lock);
+    if (latency_state & CONN_SUBRATE_PENDING) {
+        k_spin_unlock(&state_lock, key);
+        return -EBUSY;
+    }
+    latency_state |= CONN_SUBRATE_PENDING;
+    k_spin_unlock(&state_lock, key);
+
+    int err = bt_conn_le_subrate_request(conn, params);
+    if (err) {
+        /* HCI command not queued — no callback will fire.  Clear pending. */
+        state_clear_bit(CONN_SUBRATE_PENDING);
+    } else {
+        k_work_reschedule(&subrate_timeout_work, SUBRATE_TIMEOUT_MS);
+    }
+    return err;
+}
+
+static void subrate_timeout_fn(struct k_work *work) {
+    ARG_UNUSED(work);
+    k_spinlock_key_t key = k_spin_lock(&state_lock);
+    if (latency_state & CONN_SUBRATE_PENDING) {
+        latency_state &= ~CONN_SUBRATE_PENDING;
+        k_spin_unlock(&state_lock, key);
+        LOG_WRN("ble_latency: subrate request timed out, clearing PENDING");
+    } else {
+        k_spin_unlock(&state_lock, key);
+    }
+}
 #endif /* CONFIG_BT_SUBRATING */
 
 /* Background connection helpers — caller must hold state_lock. */
@@ -187,18 +250,6 @@ static struct snapshot take_snapshot(void) {
     s.state = latency_state;
     k_spin_unlock(&state_lock, key);
     return s;
-}
-
-static void state_set_bit(uint16_t bit) {
-    k_spinlock_key_t key = k_spin_lock(&state_lock);
-    latency_state |= bit;
-    k_spin_unlock(&state_lock, key);
-}
-
-static void state_clear_bit(uint16_t bit) {
-    k_spinlock_key_t key = k_spin_lock(&state_lock);
-    latency_state &= ~bit;
-    k_spin_unlock(&state_lock, key);
 }
 
 #define CONN_UPDATE_TIMEOUT_MS K_MSEC(5000)
@@ -276,8 +327,8 @@ static void request_low_latency(void) {
 
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
     if (s.state & CONN_SUBRATING_SUPPORTED) {
-        err = bt_conn_le_subrate_request(s.conn, &host_active_subrate);
-        if (err && err != -EALREADY) {
+        err = host_subrate_request(s.conn, &host_active_subrate);
+        if (err && err != -EBUSY && err != -EALREADY) {
             LOG_WRN("ble_latency: host subrate active failed (%d)", err);
         }
         /* Also restore latency=0 via param update to clear any
@@ -324,9 +375,15 @@ static void request_idle_1(void) {
 
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
     if (s.state & CONN_SUBRATING_SUPPORTED) {
-        int err = bt_conn_le_subrate_request(s.conn, &host_idle1_subrate);
-        if (err && err != -EALREADY) {
+        int err = host_subrate_request(s.conn, &host_idle1_subrate);
+        if (err && err != -EBUSY && err != -EALREADY) {
             LOG_WRN("ble_latency: host subrate idle-1 failed (%d)", err);
+        }
+        /* Ensure peripheral latency is zero — subrating and peripheral
+         * latency compound (effective = CI × factor × (1+latency)). */
+        struct bt_conn_info info;
+        if (!bt_conn_get_info(s.conn, &info) && info.le.latency > 0) {
+            update_latency_only(s.conn, 0);
         }
         state_clear_bit(CONN_LOW_LATENCY_ENABLED);
         return;
@@ -349,9 +406,15 @@ static void request_idle_2(void) {
 
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
     if (s.state & CONN_SUBRATING_SUPPORTED) {
-        int err = bt_conn_le_subrate_request(s.conn, &host_idle2_subrate);
-        if (err && err != -EALREADY) {
+        int err = host_subrate_request(s.conn, &host_idle2_subrate);
+        if (err && err != -EBUSY && err != -EALREADY) {
             LOG_WRN("ble_latency: host subrate idle-2 failed (%d)", err);
+        }
+        /* Ensure peripheral latency is zero — subrating and peripheral
+         * latency compound (effective = CI × factor × (1+latency)). */
+        struct bt_conn_info info;
+        if (!bt_conn_get_info(s.conn, &info) && info.le.latency > 0) {
+            update_latency_only(s.conn, 0);
         }
         state_clear_bit(CONN_LOW_LATENCY_ENABLED);
         return;
@@ -535,6 +598,9 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
         k_work_cancel_delayable(&idle_check_work);
         k_work_cancel_delayable(&warmup_work);
         k_work_cancel_delayable(&conn_update_timeout_work);
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+        k_work_cancel_delayable(&subrate_timeout_work);
+#endif
     }
 }
 
@@ -565,7 +631,7 @@ static void on_security_changed(struct bt_conn *conn, bt_security_t level,
          * for the idle tiers. */
         if (!(latency_state & CONN_SUBRATING_PROBED)) {
             state_set_bit(CONN_SUBRATING_PROBED);
-            int probe_err = bt_conn_le_subrate_request(conn, &host_probe_subrate);
+            int probe_err = host_subrate_request(conn, &host_probe_subrate);
             if (probe_err) {
                 LOG_WRN("ble_latency: subrate probe failed (%d)", probe_err);
             } else {
@@ -662,7 +728,9 @@ static void on_subrate_changed(struct bt_conn *conn,
     if (params->status == BT_HCI_ERR_SUCCESS) {
         bool first_probe = !(latency_state & CONN_SUBRATING_SUPPORTED);
         latency_state |= CONN_SUBRATING_SUPPORTED;
+        latency_state &= ~CONN_SUBRATE_PENDING;
         k_spin_unlock(&state_lock, key);
+        k_work_cancel_delayable(&subrate_timeout_work);
         LOG_INF("ble_latency: host subrating supported (factor=%u, cn=%u)",
                 params->factor, params->continuation_number);
         if (first_probe) {
@@ -679,12 +747,26 @@ static void on_subrate_changed(struct bt_conn *conn,
             }
         }
     } else {
-        /* Host doesn't support subrating (0x1A = LL_UNKNOWN_RSP).
-         * Fall back to peripheral latency — never probe again. */
+        bool already_supported = !!(latency_state & CONN_SUBRATING_SUPPORTED);
+        latency_state &= ~CONN_SUBRATE_PENDING;
         k_spin_unlock(&state_lock, key);
+        k_work_cancel_delayable(&subrate_timeout_work);
+
+        if (already_supported) {
+            /* Transient rejection (e.g. 0x17 while Mac handles another
+             * LL procedure).  Do NOT retry — the next natural event
+             * (keystroke or idle timeout) will re-issue via the helper's
+             * PENDING guard.  Retrying here caused a tight fail→retry
+             * loop that starved HID TX buffers (Bug 6 variant). */
+            LOG_WRN("ble_latency: host subrate rejected (0x%02x), "
+                    "will retry on next transition", params->status);
+            return;
+        }
+
+        /* Initial probe failed — host doesn't support subrating.
+         * Fall back to peripheral latency. */
         LOG_WRN("ble_latency: host subrating unsupported (0x%02x), "
                 "using peripheral latency", params->status);
-        /* Apply the idle params we deferred while waiting for the probe */
         if (zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE) {
             request_idle_1();
         } else {
@@ -797,6 +879,9 @@ static int profile_changed_listener(const zmk_event_t *eh) {
         k_work_cancel_delayable(&idle_check_work);
         k_work_cancel_delayable(&warmup_work);
         k_work_cancel_delayable(&conn_update_timeout_work);
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+        k_work_cancel_delayable(&subrate_timeout_work);
+#endif
 
         /* Push old active (now background) to deep idle */
         k_work_submit(&background_idle_work);
@@ -872,7 +957,7 @@ static int host_param_request_listener(const zmk_event_t *eh) {
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
         if (s.state & CONN_SUBRATING_SUPPORTED) {
             /* Subrating handles event spacing — snap to factor=1 */
-            bt_conn_le_subrate_request(s.conn, &host_active_subrate);
+            host_subrate_request(s.conn, &host_active_subrate);
             LOG_INF("ble_latency: host subrate restore (factor=1)");
             return ZMK_EV_EVENT_BUBBLE;
         }
@@ -935,6 +1020,9 @@ static int ble_latency_init(void) {
     k_work_init_delayable(&warmup_work, warmup_fn);
     k_work_init_delayable(&conn_update_timeout_work, conn_update_timeout_fn);
     k_work_init(&background_idle_work, background_idle_work_fn);
+#if IS_ENABLED(CONFIG_BT_SUBRATING)
+    k_work_init_delayable(&subrate_timeout_work, subrate_timeout_fn);
+#endif
     return 0;
 }
 
