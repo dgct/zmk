@@ -196,12 +196,17 @@ static void state_clear_bit(uint16_t bit) {
 
 static void conn_update_timeout_fn(struct k_work *work) {
     ARG_UNUSED(work);
+    bool was_pending = false;
     k_spinlock_key_t key = k_spin_lock(&state_lock);
     if (latency_state & CONN_UPDATE_PENDING) {
         latency_state &= ~CONN_UPDATE_PENDING;
+        was_pending = true;
         LOG_WRN("ble_latency: conn param update timed out (L2CAP rejection?)");
     }
     k_spin_unlock(&state_lock, key);
+    if (was_pending) {
+        k_work_reschedule(&idle_check_work, IDLE_TIMEOUT_MS);
+    }
 }
 
 /* Issue a param update preserving the currently negotiated CI/timeout
