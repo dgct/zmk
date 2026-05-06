@@ -15,7 +15,7 @@ manifest:
       # Kconfig.gatt; opt-in via CONFIG_BT_ATT_SENT_CB_AFTER_TX=y).
       # + P8 fix: release extra buf ref on L2CAP queue drain at disconnect
       #   (prevents net_buf pool leak across BT profile switches).
-      revision: d9661ee2
+      revision: cd1b66e0
       clone-depth: 1
       import:
         name-blocklist:
