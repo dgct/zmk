@@ -362,6 +362,18 @@ static void request_idle_2(void) {
         state_clear_bit(CONN_LOW_LATENCY_ENABLED);
         return;
     }
+    if (!(s.state & CONN_SUBRATING_PROBED)) {
+        state_set_bit(CONN_SUBRATING_PROBED);
+        int err = bt_conn_le_subrate_request(s.conn, &host_idle2_subrate);
+        if (err) {
+            LOG_WRN("ble_latency: host subrate probe failed (%d)", err);
+            /* Fall through to deep idle conn param path */
+        } else {
+            LOG_INF("ble_latency: probing host subrating support");
+            state_clear_bit(CONN_LOW_LATENCY_ENABLED);
+            return;
+        }
+    }
 #endif
 
     uint16_t interval_units =
@@ -660,8 +672,12 @@ static void on_subrate_changed(struct bt_conn *conn,
         k_spin_unlock(&state_lock, key);
         LOG_WRN("ble_latency: host subrating unsupported (0x%02x), "
                 "using peripheral latency", params->status);
-        /* Apply the idle-1 latency that we skipped during the probe */
-        request_idle_1();
+        /* Apply the idle params that we skipped during the probe */
+        if (zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE) {
+            request_idle_1();
+        } else {
+            request_idle_2();
+        }
     }
 }
 #endif /* CONFIG_BT_SUBRATING */
