@@ -57,6 +57,10 @@
 #include <zmk/events/keycode_state_changed.h>
 #include <zmk/events/position_state_changed.h>
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_SCI)
+#include <zmk/sdc/sci.h>
+#endif
+
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /*
@@ -687,6 +691,11 @@ static void on_security_changed(struct bt_conn *conn, bt_security_t level,
             }
         }
 #endif
+#if IS_ENABLED(CONFIG_ZMK_BLE_SCI)
+        /* Set flush timeout on the host link so stale HID reports are
+         * discarded instead of retransmitted after wake from idle. */
+        sci_set_flush_timeout(conn);
+#endif
     }
     if (push_bg) {
         /* Background connection just finished encryption — now safe to
@@ -791,6 +800,13 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
     }
     k_spin_unlock(&state_lock, key);
     k_work_cancel_delayable(&conn_update_timeout_work);
+#if IS_ENABLED(CONFIG_ZMK_BLE_SCI)
+    /* Recalculate flush timeout when CI changes — scales with interval
+     * to allow ~3 connection events for delivery at any CI. */
+    if (conn == active_conn) {
+        sci_set_flush_timeout(conn);
+    }
+#endif
     if (restore) {
         request_low_latency();
     }
@@ -1033,6 +1049,9 @@ static int profile_changed_listener(const zmk_event_t *eh) {
                         LOG_INF("ble_latency: probing host subrating support");
                     }
                 }
+#endif
+#if IS_ENABLED(CONFIG_ZMK_BLE_SCI)
+                sci_set_flush_timeout(s.conn);
 #endif
                 request_low_latency();
             }
