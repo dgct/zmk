@@ -339,6 +339,15 @@ static int update_latency_only(struct bt_conn *conn, uint16_t new_latency) {
         return -EALREADY;
     }
 
+    /* Same-params guard: don't send a redundant L2CAP Connection Parameter
+     * Update Request when latency already matches.  A no-op CPUQ still
+     * triggers LL_CONNECTION_UPDATE_IND on the central, blocking any
+     * concurrent vendor-specific connection update (e.g. LLPM CI switch)
+     * because BLE allows only one LL control procedure per connection. */
+    if (info.le.latency == new_latency) {
+        return -EALREADY;
+    }
+
     /* info.le.interval is already in 1.25ms units — the same units that
      * bt_le_conn_param expects for interval_min/max. No conversion needed.
      */
@@ -412,6 +421,11 @@ static void request_low_latency(void) {
         }
     } else {
         err = update_latency_only(s.conn, 0);
+        if (err == -EALREADY) {
+            /* Already at low latency — no L2CAP update needed, but mark
+             * the state so subsequent keypresses take the fast path. */
+            state_set_bit(CONN_LOW_LATENCY_ENABLED);
+        }
     }
 
     if (err == 0) {
