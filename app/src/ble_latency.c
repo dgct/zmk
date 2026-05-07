@@ -69,8 +69,15 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  * the interval field.  E.g. 1ms CI = 0x0d01.  These values are NOT valid
  * for standard L2CAP Connection Parameter Update and must be recognized
  * throughout the CI comparison logic.
+ *
+ * When CONFIG_BT_CTLR_SDC_LLPM is not set (SCI builds), LLPM intervals
+ * never appear — compile out the check so the dead branches are eliminated.
  */
+#if IS_ENABLED(CONFIG_BT_CTLR_SDC_LLPM)
 #define BLE_INTERVAL_IS_LLPM(interval) (!!((interval) & 0x0d00))
+#else
+#define BLE_INTERVAL_IS_LLPM(interval) 0
+#endif
 
 #define IDLE_TIMEOUT_MS K_MSEC(CONFIG_ZMK_BLE_HID_IDLE_TIMEOUT_MS)
 
