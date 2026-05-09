@@ -50,7 +50,7 @@ config BT_DIS_MANUF_NAME_STR
 
 # Hardware specific overrides
 
-if SOC_SERIES_NRF52X
+if SOC_SERIES_NRF52
 
 # Default on for our usage until boards implement retained bootmode.
 config NRF_STORE_REBOOT_TYPE_GPREGRET
@@ -95,7 +95,7 @@ config ZMK_HFCLK_LOCK_DISABLE_ON_IDLE
       Lets the BLE controller go back to its lazy on-demand request
       pattern during quiet periods.
 
-endif # SOC_SERIES_NRF52X
+endif # SOC_SERIES_NRF52
 
 menu "HID"
 
@@ -818,6 +818,7 @@ endmenu # ZMK
 if SOC_FAMILY_NORDIC_NRF
 
 config NRF_SOC_VALIDATE_HEADERS_DISABLED
+    bool
     default y
 
 endif
