@@ -56,37 +56,51 @@ static void each_bond(const struct bt_bond_info *info, void *user_data) {
     }
 }
 
-static int start_advertising(bool low_duty) {
+static int start_advertising(void) {
     bt_addr_le_t central_addr = bt_addr_le_none;
 
     bt_foreach_bond(BT_ID_DEFAULT, each_bond, &central_addr);
 
     if (bt_addr_le_cmp(&central_addr, BT_ADDR_LE_NONE) != 0) {
         is_bonded = true;
-        struct bt_le_adv_param adv_param = low_duty ? *BT_LE_ADV_CONN_DIR_LOW_DUTY(&central_addr)
-                                                    : *BT_LE_ADV_CONN_DIR(&central_addr);
-        return bt_le_adv_start(&adv_param, NULL, 0, NULL, 0);
+
+        // Use undirected connectable advertising with a filter accept list
+        // restricted to the bonded central. Directed advertising has a 1.28s
+        // high-duty timeout that expires before the central starts scanning
+        // after cold boot, causing unreliable reconnection. Undirected + FAL
+        // advertises indefinitely with the same peer restriction.
+        int err = bt_le_filter_accept_list_clear();
+        if (err) {
+            LOG_ERR("Failed to clear FAL (%d)", err);
+            return err;
+        }
+        err = bt_le_filter_accept_list_add(&central_addr);
+        if (err) {
+            LOG_ERR("Failed to add central to FAL (%d)", err);
+            return err;
+        }
+
+        struct bt_le_adv_param adv_param = {
+            .id = BT_ID_DEFAULT,
+            .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_FILTER_CONN,
+            .interval_min = BT_GAP_ADV_FAST_INT_MIN_2, // 100ms
+            .interval_max = BT_GAP_ADV_FAST_INT_MAX_2, // 150ms
+        };
+        return bt_le_adv_start(&adv_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
     } else {
         is_bonded = false;
         return bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
     }
-};
+}
 
-static bool low_duty_advertising = false;
 static bool enabled = false;
 
 static void advertising_cb(struct k_work *work) {
-    // NOTE: Do NOT call bt_le_adv_stop() here. Stopping a directed-advertising
-    // session frees its associated bt_conn slot, which immediately triggers the
-    // recycled() callback below, which resubmits this work — producing a tight
-    // infinite loop that starves sysworkq (kscan/PS2/HOG all hang). ble.c is
-    // already guarded out on split peripherals, so there is no other advertiser
-    // to stop here.
-    const int err = start_advertising(low_duty_advertising);
+    const int err = start_advertising();
     if (err < 0) {
         LOG_ERR("Failed to start advertising (%d)", err);
     } else {
-        LOG_DBG("Split advertising started (low_duty=%d)", low_duty_advertising);
+        LOG_DBG("Split advertising started");
     }
 }
 
@@ -97,17 +111,11 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     raise_zmk_split_peripheral_status_changed(
         (struct zmk_split_peripheral_status_changed){.connected = is_connected});
-
-    if (err == BT_HCI_ERR_ADV_TIMEOUT && enabled) {
-        low_duty_advertising = true;
-        k_work_submit(&advertising_work);
-    }
 }
 
 static void recycled(void) {
     LOG_DBG("Connection recycled, restarting advertising (enabled=%d)", enabled);
     if (enabled) {
-        low_duty_advertising = false;
         k_work_submit(&advertising_work);
     }
 }
@@ -251,8 +259,6 @@ static int zmk_peripheral_ble_complete_startup(void) {
 #else
     bt_conn_cb_register(&conn_callbacks);
     bt_conn_auth_info_cb_register(&zmk_peripheral_ble_auth_info_cb);
-
-    low_duty_advertising = false;
 
     settings_loaded = true;
     k_work_submit(&notify_status_work);
