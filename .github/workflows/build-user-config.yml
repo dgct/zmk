@@ -145,10 +145,7 @@ jobs:
         run: west zephyr-export
 
       - name: Install Zephyr Python dependencies
-        working-directory: ${{ env.base_dir }}
-        run: |
-          python3 -m ensurepip 2>/dev/null || true
-          python3 -m pip install jsonschema
+        run: apt-get update && apt-get install -y --no-install-recommends python3-jsonschema
 
       - name: West Build (${{ env.display_name }})
         working-directory: ${{ env.base_dir }}
