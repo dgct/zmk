@@ -9,13 +9,12 @@ manifest:
   projects:
     - name: zephyr
       remote: dgct
-      # v4.1.0+zmk-fixes + ls0xx VCOM sem/SPI release fix (display freeze)
-      # + P8: [backport] BT_ATT_SENT_CB_AFTER_TX (true OTA-confirmed
-      # ATT TX completion callback, ~20 LOC across att.c/l2cap.c/conn.c/
-      # Kconfig.gatt; opt-in via CONFIG_BT_ATT_SENT_CB_AFTER_TX=y).
-      # + P8 fix: release extra buf ref on L2CAP queue drain at disconnect
-      #   (prevents net_buf pool leak across BT profile switches).
-      revision: cd1b66e0
+      # v4.4.0 + ls0xx VCOM sem/SPI release fix (display freeze)
+      # + [backport] BT_ATT_SENT_CB_AFTER_TX (true OTA-confirmed
+      # ATT TX completion callback; opt-in via CONFIG_BT_ATT_SENT_CB_AFTER_TX=y).
+      # + ls0xx blanking fallback demoted to LOG_DBG.
+      # L2CAP drain fix dropped (upstream 27b56955 in v4.3.0).
+      revision: daab7f98
       clone-depth: 1
       import:
         name-blocklist:
