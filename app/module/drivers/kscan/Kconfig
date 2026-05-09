@@ -10,6 +10,11 @@ DT_COMPAT_ZMK_KSCAN_MOCK := zmk,kscan-mock
 
 if KSCAN
 
+# Zephyr v4.4 removed CONFIG_KSCAN_INIT_PRIORITY with the kscan subsystem.
+config KSCAN_INIT_PRIORITY
+    int "Keyboard scan driver init priority"
+    default 90
+
 config ZMK_KSCAN_COMPOSITE_DRIVER
     bool
     default $(dt_compat_enabled,$(DT_COMPAT_ZMK_KSCAN_COMPOSITE))
