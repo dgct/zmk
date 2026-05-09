@@ -1,5 +1,6 @@
 board:
   name: bt65
+  full_name: Bt65
   vendor: polarityworks
   socs:
     - name: nrf52840

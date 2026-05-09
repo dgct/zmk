@@ -1,5 +1,6 @@
 board:
   name: s40nc
+  full_name: S40Nc
   vendor: mechwild
   socs:
     - name: nrf52840
