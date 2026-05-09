@@ -1,7 +1,9 @@
 # Copyright (c) 2020-2023 The ZMK Contributors
 # SPDX-License-Identifier: MIT
 
-zephyr_library_amend()
+# Zephyr v4.4 removed drivers/kscan, so we create our own library
+# instead of amending the (now absent) Zephyr kscan library.
+zephyr_library_named(drivers__kscan)
 
 zephyr_library_sources_ifdef(CONFIG_ZMK_KSCAN_GPIO_DRIVER kscan_gpio.c)
 zephyr_library_sources_ifdef(CONFIG_ZMK_KSCAN_GPIO_MATRIX kscan_gpio_matrix.c)
