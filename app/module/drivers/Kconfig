@@ -1,6 +1,11 @@
 # Copyright (c) 2020 The ZMK Contributors
 # SPDX-License-Identifier: MIT
 
+# Zephyr v4.4 removed the KSCAN subsystem. Define the symbol here so ZMK's
+# kscan drivers continue to work.
+config KSCAN
+    bool "Keyboard Scan (kscan) drivers [ZMK]"
+
 rsource "gpio/Kconfig"
 rsource "kscan/Kconfig"
 rsource "sensor/Kconfig"
