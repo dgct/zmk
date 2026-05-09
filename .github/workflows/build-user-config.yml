@@ -146,7 +146,9 @@ jobs:
 
       - name: Install Zephyr Python dependencies
         working-directory: ${{ env.base_dir }}
-        run: python3 -m pip install --break-system-packages jsonschema
+        run: |
+          python3 -m ensurepip 2>/dev/null || true
+          python3 -m pip install jsonschema
 
       - name: West Build (${{ env.display_name }})
         working-directory: ${{ env.base_dir }}
