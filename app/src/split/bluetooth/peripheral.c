@@ -82,7 +82,7 @@ static int start_advertising(void) {
 
         struct bt_le_adv_param adv_param = {
             .id = BT_ID_DEFAULT,
-            .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_FILTER_CONN,
+            .options = BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_FILTER_CONN,
             .interval_min = BT_GAP_ADV_FAST_INT_MIN_2, // 100ms
             .interval_max = BT_GAP_ADV_FAST_INT_MAX_2, // 150ms
         };
