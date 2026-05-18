@@ -12,6 +12,7 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/logging/log.h>
 
@@ -96,7 +97,7 @@ static int vddh_init(const struct device *dev) {
         .gain = ADC_GAIN_1_2,
         .reference = ADC_REF_INTERNAL,
         .acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40),
-        .input_positive = SAADC_CH_PSELN_PSELN_VDDHDIV5,
+        .input_positive = NRF_SAADC_VDDHDIV5,
     };
 
     drv_data->as.resolution = 12;
