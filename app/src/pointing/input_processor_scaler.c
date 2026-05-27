@@ -22,22 +22,22 @@ struct scaler_config {
 
 static int scale_val(struct input_event *event, uint32_t mul, uint32_t div,
                      struct zmk_input_processor_state *state) {
-    int16_t value_mul = event->value * (int16_t)mul;
+    int32_t value_mul = (int32_t)event->value * (int32_t)mul;
 
     if (state && state->remainder) {
         value_mul += *state->remainder;
     }
 
-    int16_t scaled = value_mul / (int16_t)div;
+    int32_t scaled = value_mul / (int32_t)div;
 
     if (state && state->remainder) {
-        *state->remainder = value_mul - (scaled * (int16_t)div);
+        *state->remainder = (int16_t)(value_mul - (scaled * (int32_t)div));
     }
 
-    LOG_DBG("scaled %d with %d/%d to %d with remainder %d", event->value, mul, div, scaled,
+    LOG_DBG("scaled %d with %d/%d to %d with remainder %d", event->value, mul, div, (int)scaled,
             (state && state->remainder) ? *state->remainder : 0);
 
-    event->value = scaled;
+    event->value = (int16_t)scaled;
 
     return 0;
 }

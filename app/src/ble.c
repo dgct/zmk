@@ -112,9 +112,12 @@ void set_profile_address(uint8_t index, const bt_addr_le_t *addr) {
 
     memcpy(&profiles[index].peer, addr, sizeof(bt_addr_le_t));
     sprintf(setting_name, "ble/profiles/%d", index);
-    LOG_DBG("Setting profile addr for %s to %s", setting_name, addr_str);
+    LOG_INF("Setting profile addr for %s to %s", setting_name, addr_str);
 #if IS_ENABLED(CONFIG_SETTINGS)
-    settings_save_one(setting_name, &profiles[index], sizeof(struct zmk_ble_profile));
+    int err = settings_save_one(setting_name, &profiles[index], sizeof(struct zmk_ble_profile));
+    if (err) {
+        LOG_ERR("Failed to save profile %d (err %d)", index, err);
+    }
 #endif
     k_work_submit(&raise_profile_changed_event_work);
 }
@@ -453,7 +456,7 @@ static int ble_profiles_handle_set(const char *name, size_t len, settings_read_c
         char addr_str[BT_ADDR_LE_STR_LEN];
         bt_addr_le_to_str(&profiles[idx].peer, addr_str, sizeof(addr_str));
 
-        LOG_DBG("Loaded %s address for profile %d", addr_str, idx);
+        LOG_INF("Loaded %s address for profile %d", addr_str, idx);
     } else if (settings_name_steq(name, "active_profile", &next) && !next) {
         if (len != sizeof(active_profile)) {
             return -EINVAL;
@@ -525,13 +528,15 @@ static void connected(struct bt_conn *conn, uint8_t err) {
         return;
     }
 
-    LOG_DBG("Connected %s", addr);
+    LOG_INF("Connected %s", addr);
 
     update_advertising();
 
     if (is_conn_active_profile(conn)) {
-        LOG_DBG("Active profile connected");
+        LOG_INF("Active profile connected");
         k_work_submit(&raise_profile_changed_event_work);
+    } else {
+        LOG_DBG("Connected but not active profile (will check after security)");
     }
 }
 
@@ -541,7 +546,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-    LOG_DBG("Disconnected from %s (reason 0x%02x)", addr, reason);
+    LOG_INF("Disconnected from %s (reason 0x%02x)", addr, reason);
 
     bt_conn_get_info(conn, &info);
 
@@ -568,13 +573,54 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
 
 static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err) {
     char addr[BT_ADDR_LE_STR_LEN];
+    struct bt_conn_info info;
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-    if (!err) {
-        LOG_DBG("Security changed: %s level %u", addr, level);
-    } else {
+    if (err) {
         LOG_ERR("Security failed: %s level %u err %d", addr, level, err);
+        return;
+    }
+
+    LOG_INF("Security changed: %s level %u", addr, level);
+
+    bt_conn_get_info(conn, &info);
+    if (info.role != BT_CONN_ROLE_PERIPHERAL) {
+        return;
+    }
+
+    // After encryption succeeds, the peer's identity should be resolved
+    // (if IRK was available). Re-check whether this connection belongs to
+    // the active profile. If the stored profile address is an RPA that
+    // rotated, also try matching via bt_conn_lookup_addr_le (the stack
+    // may have resolved the identity internally even though the stored
+    // profile address is stale).
+    if (is_conn_active_profile(conn)) {
+        LOG_DBG("Active profile %d secured", active_profile);
+        k_work_submit(&raise_profile_changed_event_work);
+    } else {
+        // The connected peer encrypted successfully but doesn't match the
+        // active profile address. This can happen when:
+        //   - The peer's RPA rotated and the stored profile address is stale
+        //   - The peer is bonded on a different profile (stale entry)
+        // Try looking up the connection by the active profile's stored address.
+        // If the stack resolved the identity internally, this will find it.
+        struct bt_conn *lookup = bt_conn_lookup_addr_le(BT_ID_DEFAULT,
+                                                        &profiles[active_profile].peer);
+        if (lookup) {
+            if (lookup == conn) {
+                LOG_DBG("Active profile %d matched via identity lookup",
+                        active_profile);
+                k_work_submit(&raise_profile_changed_event_work);
+            }
+            bt_conn_unref(lookup);
+        } else {
+            const bt_addr_le_t *dst = bt_conn_get_dst(conn);
+            char dst_str[BT_ADDR_LE_STR_LEN];
+            bt_addr_le_to_str(dst, dst_str, sizeof(dst_str));
+            LOG_WRN("Secured peer %s does not match active profile %d",
+                    dst_str, active_profile);
+        }
     }
 }
 
@@ -587,11 +633,26 @@ static void le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t l
     LOG_INF("%s: interval %d latency %d timeout %d", addr, interval, latency, timeout);
 }
 
+static void identity_resolved(struct bt_conn *conn, const bt_addr_le_t *rpa,
+                              const bt_addr_le_t *identity) {
+    char rpa_str[BT_ADDR_LE_STR_LEN], id_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(rpa, rpa_str, sizeof(rpa_str));
+    bt_addr_le_to_str(identity, id_str, sizeof(id_str));
+    LOG_DBG("Identity resolved: %s -> %s", rpa_str, id_str);
+
+    // Now that identity is resolved, re-check active profile
+    if (is_conn_active_profile(conn)) {
+        LOG_DBG("Resolved identity matches active profile %d", active_profile);
+        k_work_submit(&raise_profile_changed_event_work);
+    }
+}
+
 static struct bt_conn_cb conn_callbacks = {
     .connected = connected,
     .disconnected = disconnected,
     .security_changed = security_changed,
     .le_param_updated = le_param_updated,
+    .identity_resolved = identity_resolved,
 };
 
 /*
@@ -636,9 +697,31 @@ static void auth_cancel(struct bt_conn *conn) {
 }
 
 static bool pairing_allowed_for_current_profile(struct bt_conn *conn) {
-    return zmk_ble_active_profile_is_open() ||
-           (IS_ENABLED(CONFIG_BT_SMP_ALLOW_UNAUTH_OVERWRITE) &&
-            bt_addr_le_cmp(zmk_ble_active_profile_addr(), bt_conn_get_dst(conn)) == 0);
+    if (zmk_ble_active_profile_is_open()) {
+        return true;
+    }
+
+    if (!IS_ENABLED(CONFIG_BT_SMP_ALLOW_UNAUTH_OVERWRITE)) {
+        return false;
+    }
+
+    const bt_addr_le_t *dst = bt_conn_get_dst(conn);
+    const bt_addr_le_t *profile_addr = zmk_ble_active_profile_addr();
+
+    if (bt_addr_le_cmp(profile_addr, dst) == 0) {
+        return true;
+    }
+
+    // If the peer's address is an RPA that wasn't resolved (bond keys failed
+    // to load from NVS), we can't verify identity via address comparison.
+    // Allow re-pairing so the bond can be re-established.
+    if (bt_addr_le_is_rpa(dst)) {
+        LOG_WRN("Allowing re-pair on profile %d: peer RPA could not be resolved "
+                "(bond keys may be missing from NVS)", active_profile);
+        return true;
+    }
+
+    return false;
 }
 
 static enum bt_security_err auth_pairing_accept(struct bt_conn *conn,
@@ -676,6 +759,11 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded) {
 
     set_profile_address(active_profile, dst);
     update_advertising();
+
+    // After re-pairing, the connection identity is now known. Raise the profile
+    // changed event so ZMK re-evaluates the endpoint (the connected() callback
+    // may have missed this if the RPA was unresolved at connection time).
+    k_work_submit(&raise_profile_changed_event_work);
 };
 
 static struct bt_conn_auth_cb zmk_ble_auth_cb_display = {

@@ -9,3 +9,4 @@ target_sources_ifdef(CONFIG_ZMK_INPUT_PROCESSOR_CODE_MAPPER app PRIVATE input_pr
 target_sources_ifdef(CONFIG_ZMK_INPUT_PROCESSOR_BEHAVIORS app PRIVATE input_processor_behaviors.c)
 target_sources_ifdef(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING app PRIVATE resolution_multipliers.c)
 target_sources_ifdef(CONFIG_ZMK_INPUT_SPLIT app PRIVATE input_split.c)
+target_sources_ifdef(CONFIG_ZMK_POINTING_IDLE_SUSPEND app PRIVATE input_idle.c)

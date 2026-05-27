@@ -233,8 +233,26 @@ static ssize_t write_hids_mouse_feature_report(struct bt_conn *conn,
 //     return 0;
 // }
 
+/* Forward declarations for event-driven HOG drain triggers */
+extern struct k_work_delayable hog_keyboard_work;
+extern struct k_work_delayable hog_consumer_work;
+#if IS_ENABLED(CONFIG_ZMK_POINTING)
+extern struct k_work_delayable hog_mouse_work;
+#endif
+
 static void input_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value) {
     host_requests_notification = (value == BT_GATT_CCC_NOTIFY) ? 1 : 0;
+
+    /* Event-driven: host just subscribed to notifications.
+     * Re-trigger all HOG workers so queued reports drain immediately
+     * instead of waiting for the -EINVAL retry timer. */
+    if (host_requests_notification) {
+        k_work_schedule(&hog_keyboard_work, K_NO_WAIT);
+        k_work_schedule(&hog_consumer_work, K_NO_WAIT);
+#if IS_ENABLED(CONFIG_ZMK_POINTING)
+        k_work_schedule(&hog_mouse_work, K_NO_WAIT);
+#endif
+    }
 }
 
 static ssize_t write_ctrl_point(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -302,7 +320,8 @@ BT_GATT_SERVICE_DEFINE(
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_CTRL_POINT, BT_GATT_CHRC_WRITE_WITHOUT_RESP,
                            BT_GATT_PERM_WRITE, NULL, write_ctrl_point, &ctrl_point));
 
-#define HOG_NOTIFY_MAX_RETRIES 10
+#define HOG_NOTIFY_MAX_RETRIES 100
+#define HOG_NOTIFY_RETRY_MS 5
 
 #if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
 /* Mirrors nRF Desktop hids.c HIDS_SUBSCRIBER_PIPELINE_SIZE + RMK
@@ -356,6 +375,83 @@ static void hog_notify_complete(struct bt_conn *conn, void *user_data) {
     k_work_reschedule(work, K_NO_WAIT);
 }
 
+/* ──── Consolidated notify-or-defer helper ────
+ *
+ * Implements the hardened event-driven notify pattern used by all HOG
+ * report types. Handles:
+ *   - Connection acquisition + security gate (event-driven wake via
+ *     hog_security_changed / input_ccc_changed callbacks)
+ *   - Transient errors: bounded retry timer as fallback for -ENOMEM
+ *     (no event exists for "ATT buffer freed by other module")
+ *   - -EPERM: re-kicks security, defers to security_changed callback
+ *   - -EINVAL: defers to input_ccc_changed callback (host subscribes)
+ *
+ * Returns:
+ *   HOG_NOTIFY_OK       — notify succeeded, report consumed
+ *   HOG_NOTIFY_DEFERRED — transient failure, worker should return
+ *                          (will be re-triggered by event or timer)
+ *   HOG_NOTIFY_DROP     — retry budget exhausted, caller should purge
+ */
+enum hog_notify_result { HOG_NOTIFY_OK = 0, HOG_NOTIFY_DEFERRED, HOG_NOTIFY_DROP };
+
+static enum hog_notify_result hog_notify_try(
+    const struct bt_gatt_attr *attr,
+    const void *data, uint16_t len,
+    struct k_work_delayable *work,
+    int *retries, const char *name)
+{
+    struct bt_conn *conn = zmk_ble_active_profile_conn();
+    if (!conn) {
+        return HOG_NOTIFY_DEFERRED;
+    }
+
+    /* Security gate: encrypted link required.
+     * Event-driven: hog_security_changed re-triggers on L2. */
+    if (bt_conn_get_security(conn) < BT_SECURITY_L2) {
+        bt_conn_set_security(conn, BT_SECURITY_L2);
+        bt_conn_unref(conn);
+        return HOG_NOTIFY_DEFERRED;
+    }
+
+    struct bt_gatt_notify_params params = {
+        .attr = attr,
+        .data = data,
+        .len = len,
+        .func = hog_notify_complete,
+        .user_data = work,
+    };
+
+    int err = bt_gatt_notify_cb(conn, &params);
+    bt_conn_unref(conn);
+
+    if (!err) {
+        *retries = 0;
+        return HOG_NOTIFY_OK;
+    }
+
+    if (err == -ENOMEM || err == -EINVAL || err == -EPERM) {
+        if (err == -EPERM) {
+            /* Re-kick encryption — security_changed will wake us */
+            struct bt_conn *c = zmk_ble_active_profile_conn();
+            if (c) { bt_conn_set_security(c, BT_SECURITY_L2); bt_conn_unref(c); }
+        }
+        if (++(*retries) > HOG_NOTIFY_MAX_RETRIES) {
+            LOG_WRN("%s: notify retry budget exhausted (err %d)", name, err);
+            *retries = 0;
+            return HOG_NOTIFY_DROP;
+        }
+        /* Fallback timer — events (CCC write, security_changed,
+         * hog_notify_complete) will typically fire first. */
+        k_work_schedule(work, K_MSEC(HOG_NOTIFY_RETRY_MS));
+        return HOG_NOTIFY_DEFERRED;
+    }
+
+    /* Non-retryable error (e.g. -ENOTCONN) — silently consume */
+    LOG_DBG("%s: notify error %d (non-retryable)", name, err);
+    *retries = 0;
+    return HOG_NOTIFY_OK;
+}
+
 K_MSGQ_DEFINE(zmk_hog_keyboard_msgq, sizeof(struct zmk_hid_keyboard_report_body),
               CONFIG_ZMK_BLE_KEYBOARD_REPORT_QUEUE_SIZE, 4);
 
@@ -368,46 +464,19 @@ void send_keyboard_report_callback(struct k_work *work) {
     struct zmk_hid_keyboard_report_body report;
 
     while (k_msgq_peek(&zmk_hog_keyboard_msgq, &report) == 0) {
-        struct bt_conn *conn = zmk_ble_active_profile_conn();
-        if (conn == NULL) {
+        enum hog_notify_result r = hog_notify_try(
+            &hog_svc.attrs[5], &report, sizeof(report),
+            &hog_keyboard_work, &hog_keyboard_retries, "kbd");
+        switch (r) {
+        case HOG_NOTIFY_OK:
+            k_msgq_get(&zmk_hog_keyboard_msgq, &report, K_NO_WAIT);
+            continue;
+        case HOG_NOTIFY_DEFERRED:
+            return;
+        case HOG_NOTIFY_DROP:
+            k_msgq_purge(&zmk_hog_keyboard_msgq);
             return;
         }
-
-        struct bt_gatt_notify_params notify_params = {
-            .attr = &hog_svc.attrs[5],
-            .data = &report,
-            .len = sizeof(report),
-            .func = hog_notify_complete,
-            .user_data = &hog_keyboard_work,
-        };
-
-        int err = bt_gatt_notify_cb(conn, &notify_params);
-        // -EINVAL: client not yet subscribed to this characteristic
-        // (BT_GATT_ENFORCE_SUBSCRIPTION). Retry like -ENOMEM so we don't
-        // silently drain the queue while the host is still subscribing.
-        if (err == -ENOMEM || err == -EINVAL) {
-            bt_conn_unref(conn);
-            if (++hog_keyboard_retries > HOG_NOTIFY_MAX_RETRIES) {
-                LOG_WRN("Notify exhaustion: dropping keyboard queue (err %d, %d retries)",
-                        err, HOG_NOTIFY_MAX_RETRIES);
-                k_msgq_purge(&zmk_hog_keyboard_msgq);
-                hog_keyboard_retries = 0;
-                return;
-            }
-            k_work_schedule(&hog_keyboard_work, K_MSEC(2));
-            return;
-        }
-
-        k_msgq_get(&zmk_hog_keyboard_msgq, &report, K_NO_WAIT);
-        hog_keyboard_retries = 0;
-
-        if (err == -EPERM) {
-            bt_conn_set_security(conn, BT_SECURITY_L2);
-        } else if (err) {
-            LOG_DBG("Error notifying %d", err);
-        }
-
-        bt_conn_unref(conn);
     }
 }
 
@@ -448,45 +517,19 @@ void send_consumer_report_callback(struct k_work *work) {
     struct zmk_hid_consumer_report_body report;
 
     while (k_msgq_peek(&zmk_hog_consumer_msgq, &report) == 0) {
-        struct bt_conn *conn = zmk_ble_active_profile_conn();
-        if (conn == NULL) {
+        enum hog_notify_result r = hog_notify_try(
+            &hog_svc.attrs[9], &report, sizeof(report),
+            &hog_consumer_work, &hog_consumer_retries, "consumer");
+        switch (r) {
+        case HOG_NOTIFY_OK:
+            k_msgq_get(&zmk_hog_consumer_msgq, &report, K_NO_WAIT);
+            continue;
+        case HOG_NOTIFY_DEFERRED:
+            return;
+        case HOG_NOTIFY_DROP:
+            k_msgq_purge(&zmk_hog_consumer_msgq);
             return;
         }
-
-        struct bt_gatt_notify_params notify_params = {
-            .attr = &hog_svc.attrs[9],
-            .data = &report,
-            .len = sizeof(report),
-            .func = hog_notify_complete,
-            .user_data = &hog_consumer_work,
-        };
-
-        int err = bt_gatt_notify_cb(conn, &notify_params);
-        // -EINVAL: client not yet subscribed (BT_GATT_ENFORCE_SUBSCRIPTION).
-        // Retry like -ENOMEM.
-        if (err == -ENOMEM || err == -EINVAL) {
-            bt_conn_unref(conn);
-            if (++hog_consumer_retries > HOG_NOTIFY_MAX_RETRIES) {
-                LOG_WRN("Notify exhaustion: dropping consumer queue (err %d, %d retries)",
-                        err, HOG_NOTIFY_MAX_RETRIES);
-                k_msgq_purge(&zmk_hog_consumer_msgq);
-                hog_consumer_retries = 0;
-                return;
-            }
-            k_work_schedule(&hog_consumer_work, K_MSEC(2));
-            return;
-        }
-
-        k_msgq_get(&zmk_hog_consumer_msgq, &report, K_NO_WAIT);
-        hog_consumer_retries = 0;
-
-        if (err == -EPERM) {
-            bt_conn_set_security(conn, BT_SECURITY_L2);
-        } else if (err) {
-            LOG_DBG("Error notifying %d", err);
-        }
-
-        bt_conn_unref(conn);
     }
 };
 
@@ -534,7 +577,24 @@ void send_mouse_report_callback(struct k_work *work) {
         if (atomic_get(&mouse_in_flight) >= HOG_MOUSE_PIPELINE_SIZE) {
             return;
         }
+#endif
 
+        /* Security pre-check: don't attempt notify until encrypted.
+         * hog_security_changed callback re-triggers when L2 is reached. */
+        {
+            struct bt_conn *conn = zmk_ble_active_profile_conn();
+            if (conn == NULL) {
+                return;
+            }
+            if (bt_conn_get_security(conn) < BT_SECURITY_L2) {
+                bt_conn_set_security(conn, BT_SECURITY_L2);
+                bt_conn_unref(conn);
+                return;
+            }
+            bt_conn_unref(conn);
+        }
+
+#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
         /* Snapshot and clear the coalesce buffer. */
         {
             k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
@@ -575,13 +635,16 @@ void send_mouse_report_callback(struct k_work *work) {
 #endif
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
-        if (err == -ENOMEM || err == -EINVAL) {
+        if (err == -ENOMEM || err == -EINVAL || err == -EPERM) {
             bt_conn_unref(conn);
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
             /* Roll back optimistic increment — completion CB won't fire. */
             atomic_dec(&mouse_in_flight);
             mouse_coalesce_restore(&report);
 #endif
+            if (err == -EPERM) {
+                bt_conn_set_security(conn, BT_SECURITY_L2);
+            }
             if (++hog_mouse_retries > HOG_NOTIFY_MAX_RETRIES) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
                 LOG_WRN("Mouse pipeline: notify exhaustion after %d retries (err %d), "
@@ -596,7 +659,7 @@ void send_mouse_report_callback(struct k_work *work) {
                 hog_mouse_retries = 0;
                 return;
             }
-            k_work_schedule(&hog_mouse_work, K_MSEC(2));
+            k_work_schedule(&hog_mouse_work, K_MSEC(HOG_NOTIFY_RETRY_MS));
             return;
         }
 
@@ -605,13 +668,7 @@ void send_mouse_report_callback(struct k_work *work) {
 #endif
         hog_mouse_retries = 0;
 
-        if (err == -EPERM) {
-#if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            atomic_dec(&mouse_in_flight);
-            mouse_coalesce_restore(&report);
-#endif
-            bt_conn_set_security(conn, BT_SECURITY_L2);
-        } else if (err) {
+        if (err) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
             atomic_dec(&mouse_in_flight);
 #endif
@@ -681,6 +738,34 @@ void zmk_hog_mouse_clear_queue(void) {
 #endif
 }
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
+
+/* ──── Event-driven security gate ────
+ * Instead of polling every 5ms waiting for the host to reach L2,
+ * we simply return when unencrypted. This callback re-triggers all
+ * HOG work items the instant encryption completes — zero polling. */
+static void hog_security_changed(struct bt_conn *conn, bt_security_t level,
+                                 enum bt_security_err err) {
+    if (err || level < BT_SECURITY_L2) {
+        return;
+    }
+
+    /* Only act on the peripheral (host-facing) role */
+    struct bt_conn_info info;
+    if (bt_conn_get_info(conn, &info) || info.role != BT_CONN_ROLE_PERIPHERAL) {
+        return;
+    }
+
+    /* Re-trigger all HOG workers — they check queue/coalesce and exit if empty */
+    k_work_schedule(&hog_keyboard_work, K_NO_WAIT);
+    k_work_schedule(&hog_consumer_work, K_NO_WAIT);
+#if IS_ENABLED(CONFIG_ZMK_POINTING)
+    k_work_schedule(&hog_mouse_work, K_NO_WAIT);
+#endif
+}
+
+BT_CONN_CB_DEFINE(hog_security_cb) = {
+    .security_changed = hog_security_changed,
+};
 
 #if IS_ENABLED(CONFIG_ZMK_HOG_RELEASE_ON_DISCONNECT)
 

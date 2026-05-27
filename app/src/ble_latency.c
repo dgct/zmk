@@ -79,6 +79,10 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define BLE_INTERVAL_IS_LLPM(interval) 0
 #endif
 
+/* Convert between microseconds and 1.25ms BLE interval units */
+#define BLE_INTERVAL_US_TO_UNITS(us) ((uint16_t)((us) / 1250))
+#define BLE_INTERVAL_UNITS_TO_US(u)  ((uint32_t)((u) * 1250))
+
 #define IDLE_TIMEOUT_MS K_MSEC(CONFIG_ZMK_BLE_HID_IDLE_TIMEOUT_MS)
 
 BUILD_ASSERT(
@@ -346,7 +350,8 @@ static int update_latency_only(struct bt_conn *conn, uint16_t new_latency) {
 
     /* At LLPM CI (1ms), peripheral latency is meaningless and the
      * vendor-specific interval encoding isn't valid for L2CAP. */
-    if (BLE_INTERVAL_IS_LLPM(info.le.interval)) {
+    uint16_t interval_units = BLE_INTERVAL_US_TO_UNITS(info.le.interval_us);
+    if (BLE_INTERVAL_IS_LLPM(interval_units)) {
         return -EALREADY;
     }
 
@@ -359,12 +364,10 @@ static int update_latency_only(struct bt_conn *conn, uint16_t new_latency) {
         return -EALREADY;
     }
 
-    /* info.le.interval is already in 1.25ms units — the same units that
-     * bt_le_conn_param expects for interval_min/max. No conversion needed.
-     */
+    /* Convert interval_us to 1.25ms units for bt_le_conn_param. */
     struct bt_le_conn_param param = {
-        .interval_min = info.le.interval,
-        .interval_max = info.le.interval,
+        .interval_min = interval_units,
+        .interval_max = interval_units,
         .latency = new_latency,
         .timeout = info.le.timeout,
     };
@@ -416,10 +419,11 @@ static void request_low_latency(void) {
     if (explore_ci) {
         ci_target = CONFIG_ZMK_BLE_FAST_CI_INTERVAL;
         explore_ci = false;
-        LOG_INF("ble_latency: dormant recovery, exploring CI=%u", ci_target);
+        LOG_DBG("ble_latency: dormant recovery, exploring CI=%u", ci_target);
     }
-    if ((s.state & CONN_WARMUP_DONE) && !BLE_INTERVAL_IS_LLPM(info.le.interval) &&
-        info.le.interval > ci_target) {
+    uint16_t cur_interval = BLE_INTERVAL_US_TO_UNITS(info.le.interval_us);
+    if ((s.state & CONN_WARMUP_DONE) && !BLE_INTERVAL_IS_LLPM(cur_interval) &&
+        cur_interval > ci_target) {
         struct bt_le_conn_param param = {
             .interval_min = ci_target,
             .interval_max = ci_target,
@@ -539,8 +543,9 @@ static void warmup_fn(struct k_work *work) {
         return;
     }
 
-    if (BLE_INTERVAL_IS_LLPM(info.le.interval) ||
-        info.le.interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
+    uint16_t warmup_interval = BLE_INTERVAL_US_TO_UNITS(info.le.interval_us);
+    if (BLE_INTERVAL_IS_LLPM(warmup_interval) ||
+        warmup_interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
         /* Host already chose a fast CI (or LLPM is active) — skip. */
         state_set_bit(CONN_WARMUP_DONE);
         return;
@@ -598,7 +603,7 @@ static void background_idle_work_fn(struct k_work *work) {
         if (err && err != -EALREADY) {
             LOG_WRN("ble_latency: bg[%d] idle push failed (%d)", i, err);
         } else {
-            LOG_INF("ble_latency: bg[%d] pushed to deep idle", i);
+            LOG_DBG("ble_latency: bg[%d] pushed to deep idle", i);
         }
     }
 }
@@ -694,7 +699,7 @@ static void on_security_changed(struct bt_conn *conn, bt_security_t level,
             if (probe_err) {
                 LOG_WRN("ble_latency: subrate probe failed (%d)", probe_err);
             } else {
-                LOG_INF("ble_latency: probing host subrating support");
+                LOG_DBG("ble_latency: probing host subrating support");
             }
         }
 #endif
@@ -728,7 +733,7 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
          * better than our target — treat as optimal CI achieved. */
         bool is_llpm = BLE_INTERVAL_IS_LLPM(interval);
         if (is_llpm) {
-            LOG_INF("ble_latency: LLPM active (interval=0x%04x)", interval);
+            LOG_DBG("ble_latency: LLPM active (interval=0x%04x)", interval);
         }
 
         if (is_llpm || interval <= CONFIG_ZMK_BLE_FAST_CI_INTERVAL) {
@@ -766,7 +771,7 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
                 ci_retry_count++;
                 latency_state &= ~CONN_LOW_LATENCY_ENABLED;
                 restore = true;
-                LOG_INF("ble_latency: CI=%u > best_ci=%u, "
+                LOG_DBG("ble_latency: CI=%u > best_ci=%u, "
                         "retry %u/%u", interval,
                         best_ci, ci_retry_count, MAX_CI_RETRIES);
             } else if (!(latency_state & CONN_WARMUP_DONE) &&
@@ -778,7 +783,7 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
                  * until retries determine the true floor. */
                 latency_state |= CONN_WARMUP_DONE;
                 latency_state |= CONN_LOW_LATENCY_ENABLED;
-                LOG_INF("ble_latency: warmup got CI=%u (target=%u), "
+                LOG_DBG("ble_latency: warmup got CI=%u (target=%u), "
                         "entering retry phase", interval, best_ci);
             } else if (!(latency_state & CONN_WARMUP_DONE)) {
                 /* Case 3: Central-initiated update before warmup
@@ -786,7 +791,7 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
                  * Accept temporarily but preserve best_ci and don't
                  * advance state — warmup timer will negotiate. */
                 latency_state |= CONN_LOW_LATENCY_ENABLED;
-                LOG_INF("ble_latency: pre-warmup CI=%u from central "
+                LOG_DBG("ble_latency: pre-warmup CI=%u from central "
                         "(will renegotiate after warmup)", interval);
             } else {
                 /* Case 4: Settle — central insists on wider CI and
@@ -794,7 +799,7 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
                 latency_state |= CONN_LOW_LATENCY_ENABLED;
                 latency_state |= CONN_CI_SETTLED;
                 best_ci = interval;
-                LOG_INF("ble_latency: settled CI=%u as best_ci "
+                LOG_DBG("ble_latency: settled CI=%u as best_ci "
                         "(retries=%u)", interval, ci_retry_count);
             }
         } else {
@@ -844,7 +849,7 @@ static void on_subrate_changed(struct bt_conn *conn,
         latency_state &= ~CONN_SUBRATE_PENDING;
         k_spin_unlock(&state_lock, key);
         k_work_cancel_delayable(&subrate_timeout_work);
-        LOG_INF("ble_latency: host subrating supported (factor=%u, cn=%u)",
+        LOG_DBG("ble_latency: host subrating supported (factor=%u, cn=%u)",
                 params->factor, params->continuation_number);
         if (first_probe) {
             /* Probe confirmed support. Now apply the appropriate tier
@@ -1014,7 +1019,7 @@ static int profile_changed_listener(const zmk_event_t *eh) {
     }
 
     if (swapped) {
-        LOG_INF("ble_latency: profile switch — reslotted active/background");
+        LOG_DBG("ble_latency: profile switch — reslotted active/background");
         k_work_cancel_delayable(&idle_check_work);
         k_work_cancel_delayable(&warmup_work);
         k_work_cancel_delayable(&conn_update_timeout_work);
@@ -1053,7 +1058,7 @@ static int profile_changed_listener(const zmk_event_t *eh) {
                         LOG_WRN("ble_latency: subrate re-probe failed (%d)",
                                 probe_err);
                     } else {
-                        LOG_INF("ble_latency: probing host subrating support");
+                        LOG_DBG("ble_latency: probing host subrating support");
                     }
                 }
 #endif
@@ -1116,7 +1121,7 @@ static int host_param_request_listener(const zmk_event_t *eh) {
         if (s.state & CONN_SUBRATING_SUPPORTED) {
             /* Subrating handles event spacing — snap to factor=1 */
             host_subrate_request(s.conn, &host_active_subrate);
-            LOG_INF("ble_latency: host subrate restore (factor=1)");
+            LOG_DBG("ble_latency: host subrate restore (factor=1)");
             return ZMK_EV_EVENT_BUBBLE;
         }
 #endif
@@ -1125,7 +1130,7 @@ static int host_param_request_listener(const zmk_event_t *eh) {
         } else {
             request_low_latency();
         }
-        LOG_INF("ble_latency: host param restore requested");
+        LOG_DBG("ble_latency: host param restore requested");
         return ZMK_EV_EVENT_BUBBLE;
     }
 
@@ -1138,7 +1143,7 @@ static int host_param_request_listener(const zmk_event_t *eh) {
     if (s.state & CONN_SUBRATING_SUPPORTED) {
         /* Subrating already controls event spacing on this link.
          * The dormant CI change is unnecessary — skip it. */
-        LOG_INF("ble_latency: host param request skipped (subrating active)");
+        LOG_DBG("ble_latency: host param request skipped (subrating active)");
         return ZMK_EV_EVENT_BUBBLE;
     }
 #endif
@@ -1160,7 +1165,7 @@ static int host_param_request_listener(const zmk_event_t *eh) {
     if (err == 0) {
         state_set_bit(CONN_UPDATE_PENDING);
         k_work_reschedule(&conn_update_timeout_work, CONN_UPDATE_TIMEOUT_MS);
-        LOG_INF("ble_latency: host param request applied "
+        LOG_DBG("ble_latency: host param request applied "
                 "(CI=%u-%u, lat=%u)", req->interval_min,
                 req->interval_max, req->latency);
     } else if (err != -EALREADY) {

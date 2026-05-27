@@ -120,6 +120,11 @@ config ZMK_INPUT_SPLIT_MAX_IN_FLIGHT
 
 endif # ZMK_INPUT_SPLIT
 
+config ZMK_POINTING_IDLE_SUSPEND
+    bool "Suspend pointing device on idle"
+    default y
+    depends on PM_DEVICE
+
 endif # ZMK_POINTING
 
 endmenu # Mouse Options

@@ -48,6 +48,21 @@ static int split_central_bt_set_enabled(bool enabled);
  */
 #define MAX_CONN_PROCESS_RETRIES 10
 
+/* Reconnect backoff after rapid disconnect storms.
+ * If >3 disconnects within DISCONNECT_WINDOW_MS, exponentially delay
+ * before restarting scan. Reset on successful GATT discovery. */
+#define DISCONNECT_WINDOW_MS  10000
+#define RECONNECT_DELAY_BASE_MS 100
+#define RECONNECT_DELAY_MAX_MS 2000
+static uint8_t consecutive_disconnect_count;
+static int64_t last_disconnect_uptime;
+static void delayed_scan_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(delayed_scan_work, delayed_scan_handler);
+
+static void delayed_scan_handler(struct k_work *work) {
+    start_scanning();
+}
+
 enum peripheral_slot_state {
     PERIPHERAL_SLOT_STATE_OPEN,
     PERIPHERAL_SLOT_STATE_CONNECTING,
@@ -63,6 +78,8 @@ struct peripheral_slot {
     struct bt_gatt_discover_params sub_discover_params;
     uint16_t run_behavior_handle;
     struct k_work_delayable conn_process_work;
+    /* GATT discovery watchdog — disconnects if discovery hangs */
+    struct k_work_delayable discovery_timeout_work;
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct bt_gatt_subscribe_params batt_lvl_subscribe_params;
     struct bt_gatt_read_params batt_lvl_read_params;
@@ -196,6 +213,8 @@ int release_peripheral_slot(int index) {
     LOG_DBG("Releasing peripheral slot at %d", index);
 
     k_work_cancel_delayable(&slot->conn_process_work);
+    /* Cancel GATT discovery watchdog on slot release */
+    k_work_cancel_delayable(&slot->discovery_timeout_work);
 
     if (slot->conn != NULL) {
         bt_conn_unref(slot->conn);
@@ -724,7 +743,23 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
     }
 #endif // IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
+    if (subscribed) {
+        /* GATT discovery completed — cancel watchdog */
+        k_work_cancel_delayable(&slot->discovery_timeout_work);
+    }
+
     return subscribed ? BT_GATT_ITER_STOP : BT_GATT_ITER_CONTINUE;
+}
+
+/* GATT discovery watchdog — disconnects stalled connections */
+static void discovery_timeout_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct peripheral_slot *slot =
+        CONTAINER_OF(dwork, struct peripheral_slot, discovery_timeout_work);
+    if (slot->conn && !slot->subscribe_params.value_handle) {
+        LOG_ERR("GATT discovery timed out after 5s — disconnecting");
+        bt_conn_disconnect(slot->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    }
 }
 
 static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
@@ -776,6 +811,14 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
 
     LOG_DBG("Current security for connection: %d", bt_conn_get_security(conn));
 
+    /* Defensive: security_changed should trigger us only after encryption
+     * is established. If we somehow run before L2, bail out silently —
+     * security_changed will re-schedule us when encryption completes. */
+    if (bt_conn_get_security(conn) < BT_SECURITY_L2) {
+        LOG_WRN("GATT discovery deferred: encryption not yet established");
+        return;
+    }
+
     if (!slot->subscribe_params.value_handle) {
         slot->discover_params.uuid = &split_service_uuid.uuid;
         slot->discover_params.func = split_central_service_discovery_func;
@@ -803,13 +846,18 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
             return;
         }
         slot->conn_process_retries = 0;
+        consecutive_disconnect_count = 0;  /* Stable link — reset backoff */
+        /* Arm 5s GATT discovery watchdog. Cancelled by
+         * release_peripheral_slot() on disconnect or by the
+         * chrc_discovery_func when all subscriptions complete. */
+        k_work_schedule(&slot->discovery_timeout_work, K_SECONDS(5));
     }
 
     struct bt_conn_info info;
 
     bt_conn_get_info(conn, &info);
 
-    LOG_DBG("New connection params: Interval: %d, Latency: %d, PHY: %d", info.le.interval,
+    LOG_DBG("New connection params: Interval: %d, Latency: %d, PHY: %d", info.le.interval_us,
             info.le.latency, info.le.phy->rx_phy);
 
     // Restart scanning if necessary.
@@ -982,10 +1030,12 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
     LOG_DBG("Connected: %s", addr);
 
     confirm_peripheral_slot_conn(conn);
-    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
-    if (slot != NULL) {
-        k_work_schedule(&slot->conn_process_work, K_NO_WAIT);
-    }
+
+    /* Kick encryption — the security_changed callback will trigger GATT
+     * discovery once LTK encryption is established. For bonded devices
+     * the SoftDevice may auto-encrypt, but this ensures it. */
+    bt_conn_set_security(conn, BT_SECURITY_L2);
+
     k_work_submit(&notify_status_work);
 }
 
@@ -1027,27 +1077,71 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     k_work_submit(&notify_status_work);
 
-    start_scanning();
+    /* Reconnect backoff after rapid disconnect storms.
+     * Normal disconnects (count ≤ 3) scan immediately. Rapid storms
+     * (>3 within 10s) get exponential backoff up to 2s. */
+    int64_t now = k_uptime_get();
+    if ((now - last_disconnect_uptime) > DISCONNECT_WINDOW_MS) {
+        consecutive_disconnect_count = 0;
+    }
+    last_disconnect_uptime = now;
+    consecutive_disconnect_count++;
+
+    if (consecutive_disconnect_count > 3) {
+        uint32_t delay = RECONNECT_DELAY_BASE_MS *
+                         (1 << MIN(consecutive_disconnect_count - 4, 4));
+        delay = MIN(delay, RECONNECT_DELAY_MAX_MS);
+        LOG_WRN("Rapid disconnect #%d — backing off %u ms",
+                consecutive_disconnect_count, delay);
+        k_work_schedule(&delayed_scan_work, K_MSEC(delay));
+    } else {
+        start_scanning();
+    }
 }
 
 static void split_central_security_changed(struct bt_conn *conn, bt_security_t level,
                                            enum bt_security_err err) {
     struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
-    if (!slot || !slot->selected_physical_layout_handle) {
+    if (!slot) {
         return;
     }
 
-    if (err > 0) {
-        LOG_DBG("Skipping updating the physical layout for peripheral with security error");
+    if (err) {
+        LOG_ERR("Security failed for peripheral (err %d), disconnecting", err);
+        bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
         return;
     }
 
     if (level < BT_SECURITY_L2) {
-        LOG_DBG("Skipping updating the physical layout for peripheral with insufficient security");
         return;
     }
 
-    k_work_submit(&update_peripherals_selected_layouts_work);
+    /* Encryption established. If GATT discovery hasn't completed yet,
+     * trigger it now. This is the event-driven entry point that replaces
+     * the old poll-based security wait in conn_process_work. */
+    if (!slot->subscribe_params.value_handle) {
+        LOG_DBG("Security level %d reached, starting GATT discovery", level);
+        k_work_schedule(&slot->conn_process_work, K_NO_WAIT);
+    }
+
+    /* Now that the link is encrypted, request 2M PHY. This replaces
+     * CONFIG_BT_AUTO_PHY_CENTRAL_2M which fires PHY update BEFORE
+     * encryption — competing for LL control procedure slots and
+     * delaying security establishment by 60-120ms. */
+    static const struct bt_conn_le_phy_param phy_2m = {
+        .options = BT_CONN_LE_PHY_OPT_NONE,
+        .pref_tx_phy = BT_GAP_LE_PHY_2M,
+        .pref_rx_phy = BT_GAP_LE_PHY_2M,
+    };
+    int phy_err = bt_conn_le_phy_update(conn, &phy_2m);
+    if (phy_err) {
+        LOG_WRN("PHY update request failed: %d", phy_err);
+    }
+
+    /* If discovery already completed, push the physical layout. */
+    if (slot->selected_physical_layout_handle) {
+        k_work_submit(&update_peripherals_selected_layouts_work);
+    }
 }
 
 static struct bt_conn_cb conn_callbacks = {
@@ -1211,6 +1305,8 @@ static int zmk_split_bt_central_init(void) {
     for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
         k_work_init_delayable(&peripherals[i].conn_process_work,
                               split_central_process_connection_work_handler);
+        k_work_init_delayable(&peripherals[i].discovery_timeout_work,
+                              discovery_timeout_handler);
     }
 
     bt_conn_cb_register(&conn_callbacks);

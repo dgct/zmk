@@ -84,6 +84,8 @@ static int note_activity(void) {
     return set_state(ZMK_ACTIVITY_ACTIVE);
 }
 
+int zmk_activity_note(void) { return note_activity(); }
+
 static int activity_event_listener(const zmk_event_t *eh) { return note_activity(); }
 
 void activity_work_handler(struct k_work *work) {
