@@ -149,6 +149,80 @@ config ZMK_SPLIT_BLE_IDLE_TIMEOUT
 
 endif # ZMK_SPLIT_BLE_IDLE_CONN_PARAMS
 
+menuconfig ZMK_BLE_QOS_OPENLL
+    bool "BLE QoS adaptive channel-map filter (open-LL controller)"
+    depends on BT_LL_SW_SPLIT
+    select BT_CTLR_QOS_CRC_HOOK
+    help
+      Blob-free QoS channel-map filter for the Zephyr software split
+      controller. Uses per-connection-event CRC statistics (via the
+      controller hook BT_CTLR_QOS_CRC_HOOK) to rate the 37 BLE data
+      channels and prune the worst ones through HCI LE Set Host Channel
+      Classification. Central-only; rates the split central/peripheral
+      link.
+
+if ZMK_BLE_QOS_OPENLL
+
+config ZMK_BLE_QOS_OPENLL_INTERVAL
+    int "QoS processing interval (ms)"
+    default 1000
+    help
+      Baseline period between channel-map evaluations when the link is
+      clean. The interval drops to INTERVAL_FAST on CRC errors and
+      doubles back toward this value each clean cycle.
+
+config ZMK_BLE_QOS_OPENLL_INTERVAL_FAST
+    int "QoS fast processing interval (ms)"
+    default 100
+    help
+      Processing period used right after CRC errors or a wake burst,
+      for rapid adaptation to new interference.
+
+config ZMK_BLE_QOS_OPENLL_STACK_SIZE
+    int "QoS thread stack size"
+    default 768
+
+config ZMK_BLE_QOS_OPENLL_MIN_CHANNEL_COUNT
+    int "Minimum channels to keep in the map"
+    default 15
+    range 2 37
+    help
+      Never prune below this many channels regardless of scores. The
+      BLE spec requires at least 2; 15 leaves comfortable headroom.
+
+config ZMK_BLE_QOS_OPENLL_REINIT_ON_WAKE
+    bool "Reset channel scores on wake from sleep"
+    default y
+    help
+      On sleep->active the RF environment may have changed, so reset all
+      channel scores to neutral and let them reconverge.
+
+config ZMK_BLE_QOS_OPENLL_HOST_MAP_MERGE
+    bool "Fold host/dongle channel map in as a soft penalty"
+    default y
+    help
+      Read the channel map the host (or dongle) assigned to the
+      peripheral-role link and penalize channels it avoids, blending its
+      independent AFH assessment into the score. Soft, not a hard veto.
+
+config ZMK_BLE_QOS_OPENLL_SCORE_W_CRC
+    int "Score weight for CRC error ratio (Q8, 256=1.0)"
+    default 1024
+
+config ZMK_BLE_QOS_OPENLL_SCORE_W_HOST
+    int "Score penalty for channels excluded by the host map"
+    default 384
+
+config ZMK_BLE_QOS_OPENLL_SCORE_BLOCK_THRESHOLD
+    int "Score at/above which a channel is pruned (if above MIN count)"
+    default 256
+
+module = ZMK_BLE_QOS_OPENLL
+module-str = ZMK BLE QoS (open-LL)
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # ZMK_BLE_QOS_OPENLL
+
 endif # ZMK_SPLIT_ROLE_CENTRAL
 
 if !ZMK_SPLIT_ROLE_CENTRAL
