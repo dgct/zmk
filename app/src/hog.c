@@ -807,7 +807,7 @@ static void hog_host_disconnected(struct bt_conn *conn, uint8_t reason) {
      * was the active profile's link. Other (background) profile links
      * dropping must not wipe state shared with the active host. */
     bt_addr_le_t *active_addr = zmk_ble_active_profile_addr();
-    if (active_addr != NULL && bt_addr_le_eq(&info.le.dst, active_addr)) {
+    if (active_addr != NULL && bt_addr_le_eq(info.le.dst, active_addr)) {
         zmk_endpoint_clear_reports();
     }
 }
