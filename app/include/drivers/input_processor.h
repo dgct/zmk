@@ -68,4 +68,4 @@ static inline int z_impl_zmk_input_processor_handle_event(const struct device *d
     return api->handle_event(dev, event, param1, param2, state);
 }
 
-#include <syscalls/input_processor.h>
+#include <zephyr/syscalls/input_processor.h>

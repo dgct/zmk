@@ -445,4 +445,4 @@ z_impl_behavior_sensor_keymap_binding_process(struct zmk_behavior_binding *bindi
  * @}
  */
 
-#include <syscalls/behavior.h>
+#include <zephyr/syscalls/behavior.h>

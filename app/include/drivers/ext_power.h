@@ -101,4 +101,4 @@ static inline int z_impl_ext_power_get(const struct device *dev) {
  * @}
  */
 
-#include <syscalls/ext_power.h>
+#include <zephyr/syscalls/ext_power.h>
