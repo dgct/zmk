@@ -325,6 +325,9 @@ config BT_DEVICE_NAME_MAX
 
 config ZMK_BLE_DYNAMIC_HID_LATENCY
     bool "Dynamically raise host-link slave latency during quiet periods"
+    # Zephyr >= 4.5 only reports rejected parameter updates through this
+    # opt-in callback; the state machine needs it to avoid 5 s stalls.
+    select BT_USER_CONN_PARAM_REJECTED
     help
       Mirrors nRF Desktop's `ble_latency.c` pattern. Keeps
       BT_PERIPHERAL_PREF_LATENCY=0 during HID activity so the host (e.g.

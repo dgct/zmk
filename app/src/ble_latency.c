@@ -923,11 +923,53 @@ static void on_subrate_changed(struct bt_conn *conn,
 }
 #endif /* CONFIG_BT_SUBRATING */
 
+#if IS_ENABLED(CONFIG_BT_USER_CONN_PARAM_REJECTED)
+/* Zephyr >= 4.5: `le_param_updated` is no longer invoked when our own
+ * parameter update is rejected (HCI error or L2CAP CPUP rejection). Without
+ * this callback the PENDING bits would only clear via the 5 s
+ * conn_update_timeout_fn, stalling every tier transition behind it.
+ *
+ * Treat a rejected CI request like a "central chose wider CI" grant: it
+ * consumes one retry, and once the retry budget is exhausted the CI is
+ * settled so we stop re-asking. Latency-only rejections just clear PENDING
+ * (same as the timeout path) and let the idle check re-evaluate.
+ */
+static void on_le_param_update_rejected(struct bt_conn *conn, uint8_t hci_err) {
+    bool was_pending = false;
+    bool was_ci_request = false;
+    k_spinlock_key_t key = k_spin_lock(&state_lock);
+    if (conn == active_conn && (latency_state & CONN_UPDATE_PENDING)) {
+        was_pending = true;
+        was_ci_request = !!(latency_state & CONN_CI_REQUEST_PENDING);
+        latency_state &= ~(CONN_UPDATE_PENDING | CONN_CI_REQUEST_PENDING);
+        if (was_ci_request) {
+            latency_state |= CONN_WARMUP_DONE;
+            if (ci_retry_count < MAX_CI_RETRIES) {
+                ci_retry_count++;
+            } else {
+                latency_state |= CONN_CI_SETTLED;
+            }
+        }
+    }
+    k_spin_unlock(&state_lock, key);
+    if (!was_pending) {
+        return;
+    }
+    LOG_WRN("ble_latency: conn param update rejected (hci_err=0x%02x)%s", hci_err,
+            was_ci_request ? " [CI request]" : "");
+    k_work_cancel_delayable(&conn_update_timeout_work);
+    k_work_reschedule(&idle_check_work, IDLE_TIMEOUT_MS);
+}
+#endif /* CONFIG_BT_USER_CONN_PARAM_REJECTED */
+
 BT_CONN_CB_DEFINE(ble_latency_conn_cb) = {
     .connected = on_connected,
     .disconnected = on_disconnected,
     .security_changed = on_security_changed,
     .le_param_updated = on_le_param_updated,
+#if IS_ENABLED(CONFIG_BT_USER_CONN_PARAM_REJECTED)
+    .le_param_update_rejected = on_le_param_update_rejected,
+#endif
 #if IS_ENABLED(CONFIG_BT_SUBRATING)
     .subrate_changed = on_subrate_changed,
 #endif
