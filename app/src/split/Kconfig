@@ -14,7 +14,9 @@ config ZMK_SPLIT_BLE
     default y
     depends on ZMK_BLE
     select BT_USER_PHY_UPDATE
-    select BT_AUTO_PHY_UPDATE
+    # BT_AUTO_PHY_UPDATE was removed in Zephyr 4.5; the per-role
+    # BT_AUTO_PHY_CENTRAL / BT_AUTO_PHY_PERIPHERAL choices replace it
+    # (central defaults to 2M, which matches the old behaviour).
 
 config ZMK_SPLIT_WIRED
     bool "Wired Split"

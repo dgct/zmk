@@ -81,8 +81,8 @@ config ZMK_STUDIO_TRANSPORT_BLE
     default y
 
 
-config BT_CONN_TX_MAX
-    default 64 if ZMK_STUDIO_TRANSPORT_BLE
+# BT_CONN_TX_MAX was removed in Zephyr 4.5 (pending TX buffers follow
+# BT_BUF_ACL_TX_COUNT).
 
 if ZMK_STUDIO_TRANSPORT_BLE
 
