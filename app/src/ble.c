@@ -37,7 +37,21 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/event_manager.h>
 #include <zmk/events/ble_active_profile_changed.h>
 
-#if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
+/* Passkey entry collects the digits from the local HID keycode pipeline. A split
+ * peripheral has no such pipeline (its key positions are forwarded to the central),
+ * so registering the passkey callbacks there only advertises KeyboardOnly IO
+ * capability. With BT_SMP_ENFORCE_MITM both halves would then negotiate Passkey
+ * Entry on the split link, and a fresh split pairing could never complete. Keep
+ * passkey entry on the half that owns the host link; the split link pairs with
+ * Just Works (LE Secure Connections). */
+#if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY) &&                                                    \
+    !(IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL))
+#define ZMK_BLE_PASSKEY_ENTRY_ACTIVE 1
+#else
+#define ZMK_BLE_PASSKEY_ENTRY_ACTIVE 0
+#endif
+
+#if ZMK_BLE_PASSKEY_ENTRY_ACTIVE
 #include <zmk/events/keycode_state_changed.h>
 
 #define PASSKEY_DIGITS 6
@@ -45,7 +59,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 static struct bt_conn *auth_passkey_entry_conn;
 RING_BUF_DECLARE(passkey_entries, PASSKEY_DIGITS);
 
-#endif /* IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY) */
+#endif /* ZMK_BLE_PASSKEY_ENTRY_ACTIVE */
 
 enum advertising_type {
     ZMK_ADV_NONE,
@@ -665,7 +679,7 @@ static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey) {
 }
 */
 
-#if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
+#if ZMK_BLE_PASSKEY_ENTRY_ACTIVE
 
 static void auth_passkey_entry(struct bt_conn *conn) {
     char addr[BT_ADDR_LE_STR_LEN];
@@ -684,7 +698,7 @@ static void auth_cancel(struct bt_conn *conn) {
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-#if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
+#if ZMK_BLE_PASSKEY_ENTRY_ACTIVE
     if (auth_passkey_entry_conn) {
         bt_conn_unref(auth_passkey_entry_conn);
         auth_passkey_entry_conn = NULL;
@@ -770,7 +784,7 @@ static struct bt_conn_auth_cb zmk_ble_auth_cb_display = {
     .pairing_accept = auth_pairing_accept,
 // .passkey_display = auth_passkey_display,
 
-#if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
+#if ZMK_BLE_PASSKEY_ENTRY_ACTIVE
     .passkey_entry = auth_passkey_entry,
 #endif
     .cancel = auth_cancel,
@@ -848,7 +862,7 @@ static int zmk_ble_init(void) {
     return 0;
 }
 
-#if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
+#if ZMK_BLE_PASSKEY_ENTRY_ACTIVE
 
 static bool zmk_ble_numeric_usage_to_value(const zmk_key_t key, const zmk_key_t one,
                                            const zmk_key_t zero, uint8_t *value) {
@@ -930,6 +944,6 @@ static int zmk_ble_listener(const zmk_event_t *eh) {
 
 ZMK_LISTENER(zmk_ble, zmk_ble_listener);
 ZMK_SUBSCRIPTION(zmk_ble, zmk_keycode_state_changed);
-#endif /* IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY) */
+#endif /* ZMK_BLE_PASSKEY_ENTRY_ACTIVE */
 
 SYS_INIT(zmk_ble_init, APPLICATION, CONFIG_ZMK_BLE_INIT_PRIORITY);
