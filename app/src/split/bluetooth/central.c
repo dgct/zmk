@@ -166,6 +166,34 @@ static struct peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
 static bool is_scanning = false;
 
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF)
+/* Scan duty backoff. The stock passive scan (BT_LE_SCAN_PASSIVE: 30 ms window
+ * every 60 ms) is a 50% receive duty for as long as a peripheral is absent,
+ * which on a split keyboard is the whole time the other half sleeps before this
+ * one. Every fresh scan start (boot, disconnect, failed connect) runs the stock
+ * parameters for CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_FAST_S seconds; after that
+ * the scan is restarted with the slow parameters. A waking peripheral still
+ * lands within a scan window or two: it advertises directed at 3.75 ms and
+ * then fast, so even a 30 ms window every 250 ms sees it.
+ *
+ * The switch runs on the system work queue while device_found runs on the
+ * Bluetooth RX context, so both paths tolerate the other having stopped the
+ * scan already (see stop_scanning and scan_slow_handler). */
+static bool scan_slow;
+static void scan_slow_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(scan_slow_work, scan_slow_handler);
+
+static const struct bt_le_scan_param scan_slow_param = {
+    .type = BT_LE_SCAN_TYPE_PASSIVE,
+    .options = BT_LE_SCAN_OPT_FILTER_DUPLICATE,
+    .interval = BT_GAP_MS_TO_SCAN_INTERVAL(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_INTERVAL_MS),
+    .window = BT_GAP_MS_TO_SCAN_WINDOW(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_WINDOW_MS),
+};
+BUILD_ASSERT(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_WINDOW_MS <=
+                 CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_INTERVAL_MS,
+             "slow scan window must not exceed the interval");
+#endif
+
 static const struct bt_uuid_128 split_service_uuid = BT_UUID_INIT_128(ZMK_SPLIT_BT_SERVICE_UUID);
 
 struct peripheral_event_wrapper {
@@ -867,8 +895,15 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
 static int stop_scanning(void) {
     LOG_DBG("Stopping peripheral scanning");
     is_scanning = false;
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF)
+    k_work_cancel_delayable(&scan_slow_work);
+#endif
 
     int err = bt_le_scan_stop();
+    if (err == -EALREADY) {
+        /* Stopped concurrently (the scan backoff switch); the goal state holds. */
+        return 0;
+    }
     if (err < 0) {
         LOG_ERR("Stop LE scan failed (err %d)", err);
         return err;
@@ -893,6 +928,8 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
     // Stop scanning so we can connect to the peripheral device.
     int err = stop_scanning();
     if (err < 0) {
+        /* Keep the slot free so the next advertisement can try again. */
+        release_peripheral_slot(slot_idx);
         return false;
     }
 
@@ -992,6 +1029,9 @@ static int start_scanning(void) {
 
     // Start scanning otherwise.
     is_scanning = true;
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF)
+    scan_slow = false;
+#endif
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
     if (err < 0) {
         // Bug C: clear flag on failure or all future scans are blocked
@@ -1001,9 +1041,46 @@ static int start_scanning(void) {
         return err;
     }
 
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF)
+    k_work_reschedule(&scan_slow_work, K_SECONDS(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_FAST_S));
+#endif
     LOG_DBG("Scanning successfully started");
     return 0;
 }
+
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF)
+static void scan_slow_handler(struct k_work *work) {
+    if (!is_scanning || scan_slow) {
+        return;
+    }
+
+    /* If device_found is connecting right now it has already stopped the scan
+     * (bt_le_scan_stop reports -EALREADY, or -EBUSY while it holds the scan
+     * lock); leave the initiator alone in that case. */
+    int err = bt_le_scan_stop();
+    if (err < 0) {
+        LOG_DBG("Scan backoff skipped, scan already stopped (%d)", err);
+        return;
+    }
+    if (!is_scanning) {
+        /* stop_scanning() ran concurrently: a connection is being created. */
+        return;
+    }
+
+    scan_slow = true;
+    err = bt_le_scan_start(&scan_slow_param, split_central_device_found);
+    if (err < 0) {
+        scan_slow = false;
+        is_scanning = false;
+        LOG_WRN("Slow scan failed to start (err %d)", err);
+        return;
+    }
+
+    LOG_INF("Peripheral scan backed off to a %u ms window every %u ms",
+            CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_WINDOW_MS,
+            CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_INTERVAL_MS);
+}
+#endif
 
 static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
     char addr[BT_ADDR_LE_STR_LEN];
@@ -1030,6 +1107,24 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
     LOG_DBG("Connected: %s", addr);
 
     confirm_peripheral_slot_conn(conn);
+
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF)
+    /* The backoff switch can restart the scan in the instant between
+     * device_found stopping it and the connection completing; with every slot
+     * now taken that scan would otherwise run until the next disconnect. */
+    if (is_scanning) {
+        bool all_connected = true;
+        for (int i = 0; i < CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS; i++) {
+            if (peripherals[i].conn == NULL) {
+                all_connected = false;
+                break;
+            }
+        }
+        if (all_connected) {
+            stop_scanning();
+        }
+    }
+#endif
 
     /* Kick encryption — the security_changed callback will trigger GATT
      * discovery once LTK encryption is established. For bonded devices

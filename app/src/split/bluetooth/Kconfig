@@ -223,6 +223,37 @@ source "subsys/logging/Kconfig.template.log_config"
 
 endif # ZMK_BLE_QOS_OPENLL
 
+config ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF
+    bool "Back off to a low-duty scan while a peripheral stays absent"
+    help
+      The stock passive scan for split peripherals (30 ms window every 60 ms)
+      is a 50% receive duty for as long as a peripheral is missing, for
+      example while the other half sleeps. Keep the stock parameters for
+      ZMK_SPLIT_BLE_CENTRAL_SCAN_FAST_S seconds after every scan start, then
+      scan ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_WINDOW_MS out of every
+      ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_INTERVAL_MS. Pair with the peripheral's
+      directed/fast advertising phases so a waking half is still found within
+      a window or two.
+
+if ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF
+
+config ZMK_SPLIT_BLE_CENTRAL_SCAN_FAST_S
+    int "Seconds of full-duty scanning after each scan start"
+    default 60
+    range 1 3600
+
+config ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_INTERVAL_MS
+    int "Slow scan interval (ms)"
+    default 250
+    range 10 10240
+
+config ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_WINDOW_MS
+    int "Slow scan window (ms)"
+    default 30
+    range 3 10240
+
+endif # ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF
+
 endif # ZMK_SPLIT_ROLE_CENTRAL
 
 if !ZMK_SPLIT_ROLE_CENTRAL
@@ -243,6 +274,22 @@ config BT_MAX_CONN
 # Allow central to specify connection parameters.
 config BT_GAP_AUTO_UPDATE_CONN_PARAMS
     default n
+
+config ZMK_SPLIT_BLE_PERIPHERAL_ADV_DIRECTED
+    bool "Start with high-duty directed advertising to the bonded central"
+    help
+      After boot, wake or a disconnect, advertise directed at the bonded
+      central for the 1.28 s the controller allows (3.75 ms events), then
+      fall back to undirected advertising with the filter accept list. A
+      scanning central connects within its first scan window instead of
+      after several 100-150 ms advertising events.
+
+config ZMK_SPLIT_BLE_PERIPHERAL_ADV_FAST_S
+    int "Seconds of fast (30-60 ms) undirected advertising before the stock 100-150 ms"
+    default 0
+    range 0 3600
+    help
+      0 keeps the stock 100-150 ms interval from the start.
 
 endif # !ZMK_SPLIT_ROLE_CENTRAL
 

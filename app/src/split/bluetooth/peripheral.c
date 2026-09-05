@@ -48,6 +48,33 @@ static bool is_connected = false;
 
 static bool is_bonded = false;
 
+static bool enabled = false;
+
+/* Reconnect advertising phases (bonded central only):
+ *   DIRECTED  high-duty directed advertising to the bonded central: 3.75 ms
+ *             events for 1.28 s, no payload. Ends with connected(err =
+ *             BT_HCI_ERR_ADV_TIMEOUT) and a recycled() callback, which restarts
+ *             advertising in the next phase.
+ *   FAST      undirected + filter accept list at 30-60 ms for
+ *             CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_ADV_FAST_S seconds.
+ *   NORMAL    undirected + filter accept list at 100-150 ms (stock ZMK).
+ * A disconnect starts the sequence over. Both knobs default off, which is the
+ * stock behaviour (NORMAL only). */
+enum adv_phase { ADV_PHASE_DIRECTED, ADV_PHASE_FAST, ADV_PHASE_NORMAL };
+
+#define ADV_FAST_S CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_ADV_FAST_S
+
+static enum adv_phase adv_phase_first(void) {
+    if (IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_ADV_DIRECTED)) {
+        return ADV_PHASE_DIRECTED;
+    }
+    return ADV_FAST_S > 0 ? ADV_PHASE_FAST : ADV_PHASE_NORMAL;
+}
+
+static enum adv_phase adv_phase = ADV_PHASE_NORMAL; /* set by set_enabled() */
+static void adv_phase_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(adv_phase_work, adv_phase_handler);
+
 static void each_bond(const struct bt_bond_info *info, void *user_data) {
     bt_addr_le_t *addr = (bt_addr_le_t *)user_data;
 
@@ -80,20 +107,34 @@ static int start_advertising(void) {
             return err;
         }
 
+        if (adv_phase == ADV_PHASE_DIRECTED) {
+            /* High duty cycle directed advertising carries no payload. */
+            err = bt_le_adv_start(BT_LE_ADV_CONN_DIR(&central_addr), NULL, 0, NULL, 0);
+            if (err == 0) {
+                LOG_DBG("Directed advertising to the bonded central");
+                return 0;
+            }
+            LOG_WRN("Directed advertising failed (%d), advertising undirected", err);
+            adv_phase = ADV_FAST_S > 0 ? ADV_PHASE_FAST : ADV_PHASE_NORMAL;
+        }
+
+        bool fast = (adv_phase == ADV_PHASE_FAST);
         struct bt_le_adv_param adv_param = {
             .id = BT_ID_DEFAULT,
             .options = BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_FILTER_CONN,
-            .interval_min = BT_GAP_ADV_FAST_INT_MIN_2, // 100ms
-            .interval_max = BT_GAP_ADV_FAST_INT_MAX_2, // 150ms
+            .interval_min = fast ? BT_GAP_ADV_FAST_INT_MIN_1 : BT_GAP_ADV_FAST_INT_MIN_2,
+            .interval_max = fast ? BT_GAP_ADV_FAST_INT_MAX_1 : BT_GAP_ADV_FAST_INT_MAX_2,
         };
-        return bt_le_adv_start(&adv_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
+        err = bt_le_adv_start(&adv_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
+        if (err == 0 && fast) {
+            k_work_reschedule(&adv_phase_work, K_SECONDS(ADV_FAST_S));
+        }
+        return err;
     } else {
         is_bonded = false;
         return bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
     }
 }
-
-static bool enabled = false;
 
 static void advertising_cb(struct k_work *work) {
     const int err = start_advertising();
@@ -106,8 +147,30 @@ static void advertising_cb(struct k_work *work) {
 
 K_WORK_DEFINE(advertising_work, advertising_cb);
 
+/* FAST phase over: drop to the stock interval. Connectable advertising stops
+ * by itself on connection, so a connected link means there is nothing to do. */
+static void adv_phase_handler(struct k_work *work) {
+    if (!enabled || is_connected || adv_phase != ADV_PHASE_FAST) {
+        return;
+    }
+    adv_phase = ADV_PHASE_NORMAL;
+    int err = bt_le_adv_stop();
+    if (err < 0 && err != -EALREADY) {
+        LOG_WRN("Failed to stop fast advertising (%d)", err);
+    }
+    k_work_submit(&advertising_work);
+}
+
 static void connected(struct bt_conn *conn, uint8_t err) {
     is_connected = (err == 0);
+
+    if (err == 0) {
+        k_work_cancel_delayable(&adv_phase_work);
+    } else if (err == BT_HCI_ERR_ADV_TIMEOUT) {
+        /* Directed phase elapsed without the central; recycled() restarts us. */
+        adv_phase = ADV_FAST_S > 0 ? ADV_PHASE_FAST : ADV_PHASE_NORMAL;
+        LOG_DBG("Directed advertising timed out, next phase %d", adv_phase);
+    }
 
     raise_zmk_split_peripheral_status_changed(
         (struct zmk_split_peripheral_status_changed){.connected = is_connected});
@@ -128,6 +191,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
     LOG_DBG("Disconnected from %s (reason 0x%02x)", addr, reason);
 
     is_connected = false;
+    adv_phase = adv_phase_first();
 
     raise_zmk_split_peripheral_status_changed(
         (struct zmk_split_peripheral_status_changed){.connected = is_connected});
@@ -191,9 +255,11 @@ static int split_peripheral_bt_set_enabled(bool en) {
 
     enabled = en;
     if (en) {
+        adv_phase = adv_phase_first();
         k_work_submit(&advertising_work);
         return 0;
     } else {
+        k_work_cancel_delayable(&adv_phase_work);
         struct bt_conn *conn = NULL;
         bt_conn_foreach(BT_CONN_TYPE_LE, find_first_conn, &conn);
         if (conn) {
