@@ -98,7 +98,10 @@ static void request_fsu(struct sci_link *link) {
         k_work_reschedule(&link->guard, K_MSEC(SCI_GUARD_MS));
         return;
     }
-    LOG_DBG("split SCI: frame space update not started (%d)", err);
+    /* The open link layer has no HCI handler for the command (it only responds
+     * to a peer's request); the SoftDevice accepts it. Either way the interval
+     * request follows. */
+    LOG_INF("split SCI: frame space update not available here (%d)", err);
 #endif
     request_rate(link);
 }
@@ -112,8 +115,10 @@ static void request_rate(struct sci_link *link) {
         .max_latency = 0,
         .continuation_number = 0,
         .supervision_timeout_10ms = SCI_TIMEOUT_10MS,
-        .min_ce_len_125us = 0,
-        .max_ce_len_125us = 0,
+        /* Informative for the controller; the host validator requires
+         * 1..0x3E7F with max >= min. Let the event span the whole interval. */
+        .min_ce_len_125us = 1,
+        .max_ce_len_125us = SCI_INTERVAL_US / 125,
     };
 
     link->attempts++;
@@ -290,12 +295,14 @@ static void sci_conn_rate_changed(struct bt_conn *conn, uint8_t status,
         return;
     }
     k_work_cancel_delayable(&link->guard);
-    if (status == BT_HCI_ERR_UNSUPP_REMOTE_FEATURE || status == BT_HCI_ERR_UNSUPP_FEATURE_PARAM_VAL ||
-        status == BT_HCI_ERR_UNSUPP_LL_PARAM_VAL) {
+    if (status == BT_HCI_ERR_UNSUPP_FEATURE_PARAM_VAL || status == BT_HCI_ERR_UNSUPP_LL_PARAM_VAL) {
         LOG_WRN("split SCI: peer rejected the rate (0x%02x)", status);
         set_state(link, SCI_GIVEN_UP);
         return;
     }
+    /* BT_HCI_ERR_UNSUPP_REMOTE_FEATURE also comes back while the page-1 feature
+     * exchange is still in flight, so it only ends the attempts once the retry
+     * budget is spent. */
     if (link->attempts >= SCI_MAX_ATTEMPTS) {
         LOG_WRN("split SCI: rate change failed (0x%02x), giving up", status);
         set_state(link, SCI_GIVEN_UP);
