@@ -211,13 +211,33 @@ BT_GATT_SERVICE_DEFINE(
                            split_svc_get_selected_phys_layout, split_svc_select_phys_layout,
                            NULL), );
 
-#define POSITION_NOTIFY_MAX_RETRIES 5
-#define SENSOR_NOTIFY_MAX_RETRIES 5
+/* The position bitmap is state, not an event: only the newest queued copy
+ * matters, and the newest copy must eventually reach the central or a key
+ * whose release it carries stays held there until the next key event. So
+ * under ATT buffer exhaustion we collapse the queue to its newest entry and
+ * keep retrying with a growing delay for as long as the link is up; a
+ * disconnect purges the queue and the central releases everything anyway.
+ * Sensor events are deltas and get the same no-drop retry. */
+#define NOTIFY_RETRY_MIN_MS 2
+#define NOTIFY_RETRY_MAX_MS 50
+
+static k_timeout_t notify_retry_delay(unsigned int *retries) {
+    unsigned int ms = NOTIFY_RETRY_MIN_MS << MIN(*retries, 5U);
+    (*retries)++;
+    return K_MSEC(MIN(ms, NOTIFY_RETRY_MAX_MS));
+}
+
+/* Drop every queued entry but the newest. */
+static void msgq_keep_newest(struct k_msgq *q, void *scratch) {
+    while (k_msgq_num_used_get(q) > 1) {
+        k_msgq_get(q, scratch, K_NO_WAIT);
+    }
+}
 
 K_MSGQ_DEFINE(position_state_msgq, sizeof(char[POS_STATE_LEN]),
               CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_POSITION_QUEUE_SIZE, 4);
 
-static int position_notify_retries;
+static unsigned int position_notify_retries;
 
 static void send_position_state_callback(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(service_position_notify_work, send_position_state_callback);
@@ -233,14 +253,13 @@ static void send_position_state_callback(struct k_work *work) {
     while (k_msgq_peek(&position_state_msgq, &state) == 0) {
         int err = bt_gatt_notify(NULL, &split_svc.attrs[1], &state, sizeof(state));
         if (err == -ENOMEM) {
-            if (++position_notify_retries > POSITION_NOTIFY_MAX_RETRIES) {
-                LOG_WRN("ATT exhaustion: dropping position notify after %d retries",
-                        POSITION_NOTIFY_MAX_RETRIES);
-                k_msgq_get(&position_state_msgq, &state, K_NO_WAIT);
-                position_notify_retries = 0;
-                continue;
+            uint8_t scratch[POS_STATE_LEN];
+            msgq_keep_newest(&position_state_msgq, scratch);
+            if (position_notify_retries == 5) {
+                LOG_WRN("ATT exhaustion: holding the newest position state until buffers free");
             }
-            k_work_schedule(&service_position_notify_work, K_MSEC(2));
+            k_work_schedule(&service_position_notify_work,
+                            notify_retry_delay(&position_notify_retries));
             return;
         }
         if (err) {
@@ -287,7 +306,7 @@ static int zmk_split_bt_position_released(uint8_t position) {
 K_MSGQ_DEFINE(sensor_state_msgq, sizeof(struct sensor_event),
               CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_POSITION_QUEUE_SIZE, 4);
 
-static int sensor_notify_retries;
+static unsigned int sensor_notify_retries;
 
 static void send_sensor_state_callback(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(service_sensor_notify_work, send_sensor_state_callback);
@@ -297,14 +316,11 @@ static void send_sensor_state_callback(struct k_work *work) {
         int err = bt_gatt_notify(NULL, &split_svc.attrs[8], &last_sensor_event,
                                  sizeof(last_sensor_event));
         if (err == -ENOMEM) {
-            if (++sensor_notify_retries > SENSOR_NOTIFY_MAX_RETRIES) {
-                LOG_WRN("ATT exhaustion: dropping sensor notify after %d retries",
-                        SENSOR_NOTIFY_MAX_RETRIES);
-                k_msgq_get(&sensor_state_msgq, &last_sensor_event, K_NO_WAIT);
-                sensor_notify_retries = 0;
-                continue;
+            if (sensor_notify_retries == 5) {
+                LOG_WRN("ATT exhaustion: holding sensor events until buffers free");
             }
-            k_work_schedule(&service_sensor_notify_work, K_MSEC(2));
+            k_work_schedule(&service_sensor_notify_work,
+                            notify_retry_delay(&sensor_notify_retries));
             return;
         }
         if (err) {
