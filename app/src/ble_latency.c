@@ -103,7 +103,7 @@ enum {
                                         * distinguish central-initiated param
                                         * updates from responses to our CI
                                         * negotiation attempts. */
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
     CONN_SUBRATING_PROBED = BIT(7),    /* subrate_request sent at least once */
     CONN_SUBRATING_SUPPORTED = BIT(8), /* host accepted subrating */
     CONN_SUBRATE_PENDING = BIT(9),     /* subrate request in-flight (awaiting callback) */
@@ -137,7 +137,7 @@ static void state_clear_bit(uint16_t bit) {
     k_spin_unlock(&state_lock, key);
 }
 
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
 static struct k_work_delayable subrate_timeout_work;
 /* LL subrate procedure timeout (BT spec: 40s max for LL procedure, but
  * the SDC typically resolves in <1s.  Use 2s as a safety net — if the
@@ -241,7 +241,7 @@ static void apply_subrate(struct bt_conn *conn,
         update_latency_only(conn, 0);
     }
 }
-#endif /* CONFIG_BT_SUBRATING */
+#endif /* CONFIG_ZMK_BLE_HOST_SUBRATING */
 
 /* Background connection helpers — caller must hold state_lock. */
 static bool bg_add(struct bt_conn *conn) {
@@ -402,7 +402,7 @@ static void request_low_latency(void) {
 
     int err;
 
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
     if (s.state & CONN_SUBRATING_SUPPORTED) {
         apply_subrate(s.conn, &host_active_subrate, "active");
         state_set_bit(CONN_LOW_LATENCY_ENABLED);
@@ -452,7 +452,7 @@ static void request_idle_1(void) {
         return;
     }
 
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
     if (s.state & CONN_SUBRATING_SUPPORTED) {
         apply_subrate(s.conn, &host_idle1_subrate, "idle-1");
         state_clear_bit(CONN_LOW_LATENCY_ENABLED);
@@ -474,7 +474,7 @@ static void request_idle_2(void) {
         return;
     }
 
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
     if (s.state & CONN_SUBRATING_SUPPORTED) {
         apply_subrate(s.conn, &host_idle2_subrate, "idle-2");
         state_clear_bit(CONN_LOW_LATENCY_ENABLED);
@@ -658,7 +658,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
         k_work_cancel_delayable(&idle_check_work);
         k_work_cancel_delayable(&warmup_work);
         k_work_cancel_delayable(&conn_update_timeout_work);
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
         k_work_cancel_delayable(&subrate_timeout_work);
 #endif
     }
@@ -684,7 +684,7 @@ static void on_security_changed(struct bt_conn *conn, bt_security_t level,
         } else {
             state_set_bit(CONN_WARMUP_DONE);
         }
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
         /* Probe subrating support immediately with factor=1 (zero-risk).
          * By the time the system goes idle (ZMK_IDLE_TIMEOUT), we'll
          * already know if the host supports subrating and can use it
@@ -808,7 +808,7 @@ static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
     }
 }
 
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
 static void on_subrate_changed(struct bt_conn *conn,
                                const struct bt_conn_le_subrate_changed *params)
 {
@@ -905,7 +905,7 @@ static void on_subrate_changed(struct bt_conn *conn,
         }
     }
 }
-#endif /* CONFIG_BT_SUBRATING */
+#endif /* CONFIG_ZMK_BLE_HOST_SUBRATING */
 
 #if IS_ENABLED(CONFIG_BT_USER_CONN_PARAM_REJECTED)
 /* Zephyr >= 4.5: `le_param_updated` is no longer invoked when our own
@@ -954,7 +954,7 @@ BT_CONN_CB_DEFINE(ble_latency_conn_cb) = {
 #if IS_ENABLED(CONFIG_BT_USER_CONN_PARAM_REJECTED)
     .le_param_update_rejected = on_le_param_update_rejected,
 #endif
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
     .subrate_changed = on_subrate_changed,
 #endif
 };
@@ -1049,7 +1049,7 @@ static int profile_changed_listener(const zmk_event_t *eh) {
         k_work_cancel_delayable(&idle_check_work);
         k_work_cancel_delayable(&warmup_work);
         k_work_cancel_delayable(&conn_update_timeout_work);
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
         k_work_cancel_delayable(&subrate_timeout_work);
 #endif
 
@@ -1072,7 +1072,7 @@ static int profile_changed_listener(const zmk_event_t *eh) {
                 } else {
                     state_set_bit(CONN_WARMUP_DONE);
                 }
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
                 /* Re-probe subrating support — latency_state was cleared
                  * above so CONN_SUBRATING_PROBED is unset.  Mirror the
                  * on_security_changed probe path. */
@@ -1140,7 +1140,7 @@ static int host_param_request_listener(const zmk_event_t *eh) {
         if (!s.conn || !(s.state & CONN_IS_SECURED)) {
             return ZMK_EV_EVENT_BUBBLE;
         }
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
         if (s.state & CONN_SUBRATING_SUPPORTED) {
             /* Subrating handles event spacing — snap to factor=1 */
             host_subrate_request(s.conn, &host_active_subrate);
@@ -1162,7 +1162,7 @@ static int host_param_request_listener(const zmk_event_t *eh) {
         return ZMK_EV_EVENT_BUBBLE;
     }
 
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
     if (s.state & CONN_SUBRATING_SUPPORTED) {
         /* Subrating already controls event spacing on this link.
          * The dormant CI change is unnecessary — skip it. */
@@ -1206,7 +1206,7 @@ static int ble_latency_init(void) {
     k_work_init_delayable(&warmup_work, warmup_fn);
     k_work_init_delayable(&conn_update_timeout_work, conn_update_timeout_fn);
     k_work_init(&background_idle_work, background_idle_work_fn);
-#if IS_ENABLED(CONFIG_BT_SUBRATING)
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
     k_work_init_delayable(&subrate_timeout_work, subrate_timeout_fn);
 #endif
     return 0;

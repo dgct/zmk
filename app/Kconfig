@@ -339,6 +339,17 @@ config ZMK_BLE_DYNAMIC_HID_LATENCY
 
 if ZMK_BLE_DYNAMIC_HID_LATENCY
 
+config ZMK_BLE_HOST_SUBRATING
+    bool "Probe and drive connection subrating on the host link"
+    depends on BT_SUBRATING
+    help
+      Send an LE Subrate Request to the host once the link is secured and,
+      when the host accepts, use subrating for the idle tiers instead of
+      peripheral latency. Hosts without the feature reject the probe and the
+      manager falls back to latency. Off by default: the open link layer's
+      peripheral-side procedure is untested against real hosts.
+
+
 config ZMK_BLE_HID_IDLE_TIMEOUT_MS
     int "HID-silence window before raising latency to Idle-1 (ms)"
     default 5000
