@@ -286,6 +286,109 @@ config ZMK_SPLIT_BLE_SCI_FSU
 
 endif # ZMK_SPLIT_BLE_SCI
 
+config ZMK_SPLIT_BLE_SUBRATING
+    bool "Activity-driven connection subrating on the split link"
+    depends on BT_SUBRATING
+    help
+      Three subrating tiers follow ZMK's activity state: ACTIVE while typing,
+      IDLE after ZMK_BLE_SUBRATE_IDLE_DELAY of idle, DORMANT after
+      ZMK_BLE_SUBRATE_DORMANT_DELAY or on sleep. Each tier is a standard LE
+      Subrate Request confirmed through the subrate_changed callback; a tier is
+      re-applied after a connection rate change, which resets the subrate. The
+      peripheral needs only BT_SUBRATING.
+
+if ZMK_SPLIT_BLE_SUBRATING
+
+
+config ZMK_BLE_SUBRATE_ACTIVE_MIN
+    int "Active subrate factor minimum"
+    default 1
+    range 1 500
+
+config ZMK_BLE_SUBRATE_ACTIVE_MAX
+    int "Active subrate factor maximum"
+    default 2
+    range 1 500
+
+config ZMK_BLE_SUBRATE_ACTIVE_CN
+    int "Active continuation number"
+    default 1
+    range 0 499
+
+
+config ZMK_BLE_SUBRATE_TIMEOUT
+    int "Supervision timeout (10ms units)"
+    default 800
+    range 10 3200
+
+config ZMK_BLE_SUBRATE_ACTIVE_MAX_LATENCY
+    int "Active maximum peripheral latency"
+    default 4
+    range 0 499
+
+# IDLE tier
+config ZMK_BLE_SUBRATE_IDLE_MIN
+    int "Idle subrate factor minimum"
+    default 1
+    range 1 500
+
+config ZMK_BLE_SUBRATE_IDLE_MAX
+    int "Idle subrate factor maximum"
+    default 15
+    range 1 500
+
+config ZMK_BLE_SUBRATE_IDLE_CN
+    int "Idle continuation number"
+    default 14
+    range 0 499
+
+config ZMK_BLE_SUBRATE_IDLE_MAX_LATENCY
+    int "Idle maximum peripheral latency"
+    default 2
+    range 0 499
+
+# IDLE tier entry delay
+config ZMK_BLE_SUBRATE_IDLE_DELAY
+    int "Milliseconds of ZMK idle before the IDLE tier"
+    default 30000
+    range 0 3600000
+    help
+      The split link leaves the ACTIVE tier for the IDLE tier this many
+      milliseconds after ZMK reports the idle activity state. ZMK's own
+      idle timeout (ZMK_IDLE_TIMEOUT) is often set short for display or
+      trackpad power management; this delay keeps the split link at full
+      rate across ordinary typing pauses, so the first key after a pause
+      is not held for a subrated interval. 0 enters IDLE immediately.
+
+# DORMANT tier
+config ZMK_BLE_SUBRATE_DORMANT_DELAY
+    int "Milliseconds before dormant tier"
+    default 900000
+    range 10000 3600000
+
+config ZMK_BLE_SUBRATE_DORMANT_MIN
+    int "Dormant subrate factor minimum"
+    default 1
+    range 1 500
+
+config ZMK_BLE_SUBRATE_DORMANT_MAX
+    int "Dormant subrate factor maximum"
+    default 80
+    range 1 500
+
+config ZMK_BLE_SUBRATE_DORMANT_CN
+    int "Dormant continuation number"
+    default 20
+    range 0 499
+
+config ZMK_BLE_SUBRATE_DORMANT_MAX_LATENCY
+    int "Dormant maximum peripheral latency"
+    default 0
+    range 0 499
+
+
+endif # ZMK_SPLIT_BLE_SUBRATING
+
 endif # ZMK_SPLIT_ROLE_CENTRAL
 
 if !ZMK_SPLIT_ROLE_CENTRAL
