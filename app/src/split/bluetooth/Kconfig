@@ -254,6 +254,38 @@ config ZMK_SPLIT_BLE_CENTRAL_SCAN_SLOW_WINDOW_MS
 
 endif # ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF
 
+config ZMK_SPLIT_BLE_SCI
+    bool "Shorter Connection Intervals on the split link (Core 6.2)"
+    depends on BT_SHORTER_CONNECTION_INTERVALS
+    help
+      Once a split peripheral link is encrypted and on 2M PHY, negotiate the
+      frame space and then ZMK_SPLIT_BLE_SCI_INTERVAL_US through the host's
+      connection rate API. Driven by the frame_space_updated and
+      conn_rate_changed callbacks; works on the open LL and the SoftDevice.
+      The peripheral must be built with the same BT 6.x features.
+
+if ZMK_SPLIT_BLE_SCI
+
+config ZMK_SPLIT_BLE_SCI_INTERVAL_US
+    int "Split link connection interval (us)"
+    default 2000
+    range 750 7500
+
+config ZMK_SPLIT_BLE_SCI_SUPERVISION_TIMEOUT
+    int "Supervision timeout at the short interval (10 ms units)"
+    default 600
+    range 10 3200
+
+config ZMK_SPLIT_BLE_SCI_FSU
+    bool "Negotiate the frame space before the interval"
+    depends on BT_FRAME_SPACE_UPDATE
+    default y
+    help
+      Ask for the smallest inter-frame space the controllers support on 2M
+      PHY so more exchanges fit into the short connection event.
+
+endif # ZMK_SPLIT_BLE_SCI
+
 endif # ZMK_SPLIT_ROLE_CENTRAL
 
 if !ZMK_SPLIT_ROLE_CENTRAL

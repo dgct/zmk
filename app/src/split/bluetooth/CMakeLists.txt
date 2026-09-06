@@ -7,6 +7,7 @@ if (NOT CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 endif()
 if (CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
   target_sources(app PRIVATE central.c)
+  target_sources_ifdef(CONFIG_ZMK_SPLIT_BLE_SCI app PRIVATE split_link_sci.c)
 endif()
 
 if (CONFIG_ZMK_BLE_QOS_OPENLL)
