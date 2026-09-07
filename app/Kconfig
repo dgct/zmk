@@ -594,6 +594,16 @@ config ZMK_SLEEP_PREVENT_WHILE_USB_POWERED
     bool "Prevent sleeping while USB power is connected"
     default y
 
+config ZMK_SLEEP_TRACE
+    bool "Remember how far the last deep-sleep entry got"
+    default y
+    help
+      Write a marker at every step of the sleep entry into RAM that a reset
+      keeps (System OFF clears it). The next boot logs the marker it finds
+      and stores it in settings under "sleep/last", so a half that had to be
+      reset by hand reports whether it ever powered off and, if not, which
+      step or device it stopped at. A few bytes of RAM, no runtime cost.
+
 config ZMK_SLEEP_DEBUG
     bool "Log every step of the deep-sleep entry"
     help

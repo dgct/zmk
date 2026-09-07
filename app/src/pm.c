@@ -24,6 +24,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include <zmk/endpoints.h>
 #include <zmk/pm.h>
+#include <zmk/sleep_trace.h>
 
 #if IS_ENABLED(CONFIG_ZMK_SLEEP_DEBUG)
 #define SLEEP_LOG(...) LOG_INF(__VA_ARGS__)
@@ -61,6 +62,7 @@ int zmk_pm_suspend_devices(void) {
             continue;
         }
 
+        zmk_sleep_trace(ZMK_SLEEP_TRACE_SUSPEND_DEV + (uint32_t)(dev - devs));
         ret = pm_device_action_run(dev, PM_DEVICE_ACTION_SUSPEND);
         /* ignore devices not supporting or already at the given state */
         if ((ret == -ENOSYS) || (ret == -ENOTSUP) || (ret == -EALREADY)) {
@@ -117,6 +119,7 @@ void zmk_pm_prepare_for_poweroff(void) {
         if (pm_device_wakeup_is_enabled(dev)) {
             pm_device_wakeup_enable(dev, false);
         }
+        zmk_sleep_trace(ZMK_SLEEP_TRACE_PREPARE_DEV + (uint32_t)i);
         int ret = pm_device_action_run(dev, PM_DEVICE_ACTION_SUSPEND);
 
         if (ret != -ENOSYS && ret != -ENOTSUP && ret != -EALREADY) {
@@ -126,6 +129,7 @@ void zmk_pm_prepare_for_poweroff(void) {
 #endif // IS_ENABLED(CONFIG_PM_DEVICE)
 
 #if HAS_WAKERS
+    zmk_sleep_trace(ZMK_SLEEP_TRACE_WAKE_SOURCES);
     for (int i = 0; i < ARRAY_SIZE(soft_off_wakeup_sources); i++) {
         const struct device *dev = soft_off_wakeup_sources[i];
         bool enabled = pm_device_wakeup_enable(dev, true);

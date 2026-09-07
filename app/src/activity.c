@@ -19,6 +19,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/events/sensor_event.h>
 
 #include <zmk/pm.h>
+#include <zmk/sleep_trace.h>
 
 #include <zmk/activity.h>
 
@@ -109,8 +110,10 @@ void activity_work_handler(struct k_work *work) {
     #endif
     if (inactive_time > MAX_SLEEP_MS && !prevent_sleep) {
         SLEEP_LOG("sleep: %d ms inactive, entering deep sleep", inactive_time);
+        zmk_sleep_trace(ZMK_SLEEP_TRACE_ENTER);
         // Put devices in suspend power mode before sleeping
         set_state(ZMK_ACTIVITY_SLEEP);
+        zmk_sleep_trace(ZMK_SLEEP_TRACE_LISTENERS_DONE);
         SLEEP_LOG("sleep: listeners done, preparing devices and wake sources");
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
@@ -129,12 +132,17 @@ void activity_work_handler(struct k_work *work) {
         zmk_pm_prepare_for_poweroff();
         SLEEP_LOG("sleep: wake sources armed, suspending the rest");
 #endif
+        zmk_sleep_trace(ZMK_SLEEP_TRACE_PREPARED);
 
         zmk_pm_suspend_devices();
+        zmk_sleep_trace(ZMK_SLEEP_TRACE_DEVICES_SUSPENDED);
         zmk_pm_log_wake_pins();
+        zmk_sleep_trace(ZMK_SLEEP_TRACE_WAKE_PINS_LOGGED);
         SLEEP_LOG("sleep: powering off");
 
+        zmk_sleep_trace(ZMK_SLEEP_TRACE_POWERING_OFF);
         sys_poweroff();
+        zmk_sleep_trace(ZMK_SLEEP_TRACE_POWEROFF_RETURNED);
         SLEEP_LOG("sleep: sys_poweroff returned");
     } else
 #endif /* IS_ENABLED(CONFIG_ZMK_SLEEP) */
