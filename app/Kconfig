@@ -594,6 +594,15 @@ config ZMK_SLEEP_PREVENT_WHILE_USB_POWERED
     bool "Prevent sleeping while USB power is connected"
     default y
 
+config ZMK_SLEEP_DEBUG
+    bool "Log every step of the deep-sleep entry"
+    help
+      Log the sleep sequence at INF level: the inactivity that triggered it,
+      every device whose suspend did something (or failed), the wake-source
+      re-enable, and on nRF every GPIO pin whose SENSE is armed right before
+      the system powers off. Pair it with immediate logging so the last lines
+      reach the console before the power goes.
+
 endif # ZMK_SLEEP
 
 config ZMK_EXT_POWER

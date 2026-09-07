@@ -37,6 +37,12 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zephyr/input/input.h>
 #endif
 
+#if IS_ENABLED(CONFIG_ZMK_SLEEP_DEBUG)
+#define SLEEP_LOG(...) LOG_INF(__VA_ARGS__)
+#else
+#define SLEEP_LOG(...)
+#endif
+
 bool is_usb_power_present(void) {
 #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
     /* Prefer the hardware VBUS bit to the USB-stack enumeration state.
@@ -102,17 +108,23 @@ void activity_work_handler(struct k_work *work) {
         #endif
     #endif
     if (inactive_time > MAX_SLEEP_MS && !prevent_sleep) {
+        SLEEP_LOG("sleep: %d ms inactive, entering deep sleep", inactive_time);
         // Put devices in suspend power mode before sleeping
         set_state(ZMK_ACTIVITY_SLEEP);
+        SLEEP_LOG("sleep: listeners done, preparing devices and wake sources");
 
         // Disable all wakeup sources, suspend all devices, then
         // re-enable only the designated wakeup sources (e.g. kscan)
         // so GPIO SENSE wake works correctly from SYSTEMOFF.
         zmk_pm_prepare_for_poweroff();
+        SLEEP_LOG("sleep: wake sources armed, suspending the rest");
 
         zmk_pm_suspend_devices();
+        zmk_pm_log_wake_pins();
+        SLEEP_LOG("sleep: powering off");
 
         sys_poweroff();
+        SLEEP_LOG("sleep: sys_poweroff returned");
     } else
 #endif /* IS_ENABLED(CONFIG_ZMK_SLEEP) */
         if (inactive_time > MAX_IDLE_MS) {

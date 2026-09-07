@@ -15,7 +15,21 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+/* The nRF HAL must come before the ZMK headers: dt-bindings/zmk/keys.h
+ * defines single-letter key macros (P, ...) that break nrfx's P0/P1 token
+ * pasting. */
+#if IS_ENABLED(CONFIG_ZMK_SLEEP_DEBUG) && defined(CONFIG_SOC_FAMILY_NORDIC_NRF)
+#include <hal/nrf_gpio.h>
+#endif
+
 #include <zmk/endpoints.h>
+#include <zmk/pm.h>
+
+#if IS_ENABLED(CONFIG_ZMK_SLEEP_DEBUG)
+#define SLEEP_LOG(...) LOG_INF(__VA_ARGS__)
+#else
+#define SLEEP_LOG(...)
+#endif
 
 // Reimplement some of the device work from Zephyr PM to work with the new `sys_poweroff` API.
 // TODO: Tweak this to smarter runtime PM of subsystems on sleep.
@@ -57,10 +71,12 @@ int zmk_pm_suspend_devices(void) {
             continue;
         }
 
+        SLEEP_LOG("sleep: suspended %s", dev->name);
         TYPE_SECTION_START(pm_device_slots)[zmk_num_susp] = dev;
         zmk_num_susp++;
     }
 
+    SLEEP_LOG("sleep: %u device(s) suspended", (unsigned int)zmk_num_susp);
     return 0;
 }
 
@@ -101,17 +117,47 @@ void zmk_pm_prepare_for_poweroff(void) {
         if (pm_device_wakeup_is_enabled(dev)) {
             pm_device_wakeup_enable(dev, false);
         }
-        pm_device_action_run(dev, PM_DEVICE_ACTION_SUSPEND);
+        int ret = pm_device_action_run(dev, PM_DEVICE_ACTION_SUSPEND);
+
+        if (ret != -ENOSYS && ret != -ENOTSUP && ret != -EALREADY) {
+            SLEEP_LOG("sleep: prepare: suspend %s -> %d", dev->name, ret);
+        }
     }
 #endif // IS_ENABLED(CONFIG_PM_DEVICE)
 
 #if HAS_WAKERS
     for (int i = 0; i < ARRAY_SIZE(soft_off_wakeup_sources); i++) {
         const struct device *dev = soft_off_wakeup_sources[i];
-        pm_device_wakeup_enable(dev, true);
-        pm_device_action_run(dev, PM_DEVICE_ACTION_RESUME);
+        bool enabled = pm_device_wakeup_enable(dev, true);
+        int ret = pm_device_action_run(dev, PM_DEVICE_ACTION_RESUME);
+
+        SLEEP_LOG("sleep: wake source %s: wakeup enabled %d, resume -> %d", dev->name,
+                  (int)enabled, ret);
+        ARG_UNUSED(enabled);
+        ARG_UNUSED(ret);
     }
 #endif // HAS_WAKERS
+}
+
+void zmk_pm_log_wake_pins(void) {
+#if IS_ENABLED(CONFIG_ZMK_SLEEP_DEBUG) && defined(CONFIG_SOC_FAMILY_NORDIC_NRF)
+    int armed = 0;
+
+    for (uint32_t pin = 0; pin < 32 * GPIO_COUNT; pin++) {
+        if (!nrf_gpio_pin_present_check(pin)) {
+            continue;
+        }
+        nrf_gpio_pin_sense_t sense = nrf_gpio_pin_sense_get(pin);
+        if (sense == NRF_GPIO_PIN_NOSENSE) {
+            continue;
+        }
+        LOG_INF("sleep: wake pin P%u.%02u sense %s, reads %u", pin / 32, pin % 32,
+                sense == NRF_GPIO_PIN_SENSE_HIGH ? "high" : "low", nrf_gpio_pin_read(pin));
+        armed++;
+    }
+    LOG_INF("sleep: %d wake pin(s) armed, latch P0 0x%08x P1 0x%08x", armed, NRF_P0->LATCH,
+            NRF_P1->LATCH);
+#endif
 }
 
 #if IS_ENABLED(CONFIG_ZMK_PM_SOFT_OFF)
