@@ -113,11 +113,22 @@ void activity_work_handler(struct k_work *work) {
         set_state(ZMK_ACTIVITY_SLEEP);
         SLEEP_LOG("sleep: listeners done, preparing devices and wake sources");
 
+#if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+        // Peripheral: upstream's sequence. The key matrix is a wake-up
+        // source (enabled at init) and zmk_pm_suspend_devices() leaves it
+        // alone, so it keeps the armed level interrupts (GPIO SENSE) it has
+        // while idle. The soft-off dance below (suspend everything, then
+        // disconnect the matrix pins, resume and rescan it) was added for
+        // the central half; on this half it is the only step that differs
+        // from upstream, and the peripheral did not come back from sleep.
+        SLEEP_LOG("sleep: peripheral, key matrix stays armed");
+#else
         // Disable all wakeup sources, suspend all devices, then
         // re-enable only the designated wakeup sources (e.g. kscan)
         // so GPIO SENSE wake works correctly from SYSTEMOFF.
         zmk_pm_prepare_for_poweroff();
         SLEEP_LOG("sleep: wake sources armed, suspending the rest");
+#endif
 
         zmk_pm_suspend_devices();
         zmk_pm_log_wake_pins();
