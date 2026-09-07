@@ -596,7 +596,7 @@ config ZMK_SLEEP_PREVENT_WHILE_USB_POWERED
 
 config ZMK_SLEEP_TRACE
     bool "Remember how far the last deep-sleep entry got"
-    default y
+    default n
     help
       Write a marker at every step of the sleep entry into RAM that a reset
       keeps (System OFF clears it). The next boot logs the marker it finds

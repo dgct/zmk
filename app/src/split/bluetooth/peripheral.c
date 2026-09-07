@@ -35,6 +35,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include <zmk/event_manager.h>
 #include <zmk/events/split_peripheral_status_changed.h>
+#include <zmk/events/activity_state_changed.h>
 #include <zmk/ble.h>
 #include <zmk/split/bluetooth/uuid.h>
 
@@ -365,3 +366,45 @@ static int zmk_peripheral_ble_init(void) {
 }
 
 SYS_INIT(zmk_peripheral_ble_init, APPLICATION, CONFIG_ZMK_BLE_INIT_PRIORITY);
+
+/*
+ * Quiesce the radio before deep sleep, as the central does (central.c stops
+ * scanning and disconnects on ZMK_ACTIVITY_SLEEP) and as the ESB transport
+ * does for its radio. With the SoftDevice Controller the radio and timer
+ * interrupts are zero-latency and stay enabled through the irq_lock() in
+ * sys_poweroff(); an advertising peripheral (this half sleeps within a
+ * second of the link dropping, in the middle of directed advertising) can
+ * therefore still be servicing radio events when SYSTEMOFF is written.
+ * Stop advertising and drop any link first; re-enable on ACTIVE in case
+ * the sleep is aborted.
+ */
+static bool disabled_for_sleep;
+
+static int split_peripheral_bt_activity_listener(const zmk_event_t *eh) {
+    const struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
+
+    if (ev == NULL) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+    switch (ev->state) {
+    case ZMK_ACTIVITY_SLEEP:
+        if (enabled) {
+            LOG_DBG("Sleep: stopping advertising and dropping the split link");
+            disabled_for_sleep = true;
+            split_peripheral_bt_set_enabled(false);
+        }
+        break;
+    case ZMK_ACTIVITY_ACTIVE:
+        if (disabled_for_sleep) {
+            disabled_for_sleep = false;
+            split_peripheral_bt_set_enabled(true);
+        }
+        break;
+    default:
+        break;
+    }
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(split_peripheral_bt_activity, split_peripheral_bt_activity_listener);
+ZMK_SUBSCRIPTION(split_peripheral_bt_activity, zmk_activity_state_changed);
