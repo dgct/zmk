@@ -220,6 +220,7 @@ BT_GATT_SERVICE_DEFINE(
  * Sensor events are deltas and get the same no-drop retry. */
 #define NOTIFY_RETRY_MIN_MS 2
 #define NOTIFY_RETRY_MAX_MS 50
+#define NOTIFY_RETRY_MAX_COUNT 100 /* about 5 s once the delay has reached its cap */
 
 static k_timeout_t notify_retry_delay(unsigned int *retries) {
     unsigned int ms = NOTIFY_RETRY_MIN_MS << MIN(*retries, 5U);
@@ -252,18 +253,24 @@ static void send_position_state_callback(struct k_work *work) {
     }
     while (k_msgq_peek(&position_state_msgq, &state) == 0) {
         int err = bt_gatt_notify(NULL, &split_svc.attrs[1], &state, sizeof(state));
-        if (err == -ENOMEM) {
+        /* Any failure while the link is up gets the same treatment as ATT
+         * exhaustion: keep the newest state and retry. The central is
+         * "connected" long before it has discovered the service and enabled
+         * notifications, so the first key after a reconnect used to fail
+         * with an error other than -ENOMEM and be discarded. Bounded so a
+         * link that never subscribes cannot spin: 5 s at the longest delay. */
+        if (err && position_notify_retries < NOTIFY_RETRY_MAX_COUNT) {
             uint8_t scratch[POS_STATE_LEN];
             msgq_keep_newest(&position_state_msgq, scratch);
             if (position_notify_retries == 5) {
-                LOG_WRN("ATT exhaustion: holding the newest position state until buffers free");
+                LOG_WRN("Position notify failing (%d): holding the newest state and retrying", err);
             }
             k_work_schedule(&service_position_notify_work,
                             notify_retry_delay(&position_notify_retries));
             return;
         }
         if (err) {
-            LOG_DBG("Error notifying %d", err);
+            LOG_WRN("Position state dropped after %u attempts (%d)", position_notify_retries, err);
         }
         k_msgq_get(&position_state_msgq, &state, K_NO_WAIT);
         position_notify_retries = 0;
@@ -287,7 +294,8 @@ int send_position_state() {
         }
     }
 
-    k_work_schedule(&service_position_notify_work, K_NO_WAIT);
+    /* reschedule: a fresh key must not wait out a pending retry delay */
+    k_work_reschedule(&service_position_notify_work, K_NO_WAIT);
 
     return 0;
 }

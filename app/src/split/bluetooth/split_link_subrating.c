@@ -28,6 +28,7 @@
 #include <zephyr/bluetooth/hci_types.h>
 #include <zephyr/logging/log.h>
 
+#include <zmk/activity.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/activity_state_changed.h>
 
@@ -206,17 +207,18 @@ static void conn_rate_changed_cb(struct bt_conn *conn, uint8_t status,
         info.role != BT_CONN_ROLE_CENTRAL) {
         return;
     }
-    if (params->subrate_factor != tier_params[current_tier].subrate_max) {
-        tier_retry_count = 0;
-        apply_tier(current_tier, true);
-    }
+    /* The rate request carried subrate 1 and latency 0; the tier's own
+     * latency and factor are applied on top of the new interval. */
+    tier_retry_count = 0;
+    apply_tier(current_tier, true);
 }
 #endif
 
-/* A new central link runs the ACTIVE defaults (subrating_init). If the
- * keyboard is idle while the link comes up, apply the idle tier once the link
- * is encrypted: by then the feature exchange has run and the request is
- * accepted. */
+/* A new central link runs the ACTIVE defaults (subrating_init) and stays
+ * there through discovery, the PHY update and the interval negotiation.
+ * If the keyboard is idle while the link comes up, the idle tier follows
+ * after the usual delay rather than being forced onto a link that is still
+ * at 7.5 ms, where factor 50 would mean a 375 ms cadence. */
 static void security_changed_cb(struct bt_conn *conn, bt_security_t level,
                                 enum bt_security_err err) {
     struct bt_conn_info info;
@@ -225,9 +227,8 @@ static void security_changed_cb(struct bt_conn *conn, bt_security_t level,
         info.role != BT_CONN_ROLE_CENTRAL) {
         return;
     }
-    if (current_tier != TIER_ACTIVE) {
-        tier_retry_count = 0;
-        apply_tier(current_tier, true);
+    if (zmk_activity_get_state() != ZMK_ACTIVITY_ACTIVE) {
+        k_work_reschedule(&idle_work, K_MSEC(SUBRATE_IDLE_DELAY_MS));
     }
 }
 
@@ -238,6 +239,10 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason) {
         return;
     }
     k_work_cancel_delayable(&tier_retry_work);
+    k_work_cancel_delayable(&idle_work);
+    k_work_cancel_delayable(&dormant_work);
+    /* The next link starts from the defaults, which are the ACTIVE tier. */
+    current_tier = TIER_ACTIVE;
     tier_confirmed = true;
     tier_retry_count = 0;
 }

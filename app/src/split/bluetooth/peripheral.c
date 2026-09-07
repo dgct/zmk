@@ -91,11 +91,11 @@ static int start_advertising(void) {
     if (bt_addr_le_cmp(&central_addr, BT_ADDR_LE_NONE) != 0) {
         is_bonded = true;
 
-        // Use undirected connectable advertising with a filter accept list
-        // restricted to the bonded central. Directed advertising has a 1.28s
-        // high-duty timeout that expires before the central starts scanning
-        // after cold boot, causing unreliable reconnection. Undirected + FAL
-        // advertises indefinitely with the same peer restriction.
+        // Undirected connectable advertising with a filter accept list
+        // restricted to the bonded central; it advertises indefinitely with
+        // the same peer restriction. The optional directed phase
+        // (ZMK_SPLIT_BLE_PERIPHERAL_ADV_DIRECTED) runs before this for
+        // 1.28 s and hands over here on its timeout.
         int err = bt_le_filter_accept_list_clear();
         if (err) {
             LOG_ERR("Failed to clear FAL (%d)", err);

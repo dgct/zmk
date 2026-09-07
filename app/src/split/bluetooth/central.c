@@ -907,22 +907,21 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
 
 static int stop_scanning(void) {
     LOG_DBG("Stopping peripheral scanning");
+
+    int err = bt_le_scan_stop();
+    if (err < 0 && err != -EALREADY) {
+        /* The scanner may still be running: keep the bookkeeping honest and
+         * let the manager try again shortly. */
+        LOG_ERR("Stop LE scan failed (err %d)", err);
+        k_work_reschedule(&delayed_scan_work, K_MSEC(100));
+        return err;
+    }
     is_scanning = false;
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_SCAN_BACKOFF)
     scan_slow = false;
     scan_slow_due = false;
     k_work_cancel_delayable(&scan_slow_work);
 #endif
-
-    int err = bt_le_scan_stop();
-    if (err == -EALREADY) {
-        return 0;
-    }
-    if (err < 0) {
-        LOG_ERR("Stop LE scan failed (err %d)", err);
-        return err;
-    }
-
     return 0;
 }
 
@@ -1120,8 +1119,14 @@ static void link_mgr_handler(struct k_work *work) {
         try_connect(&addr);
     }
 
-    bool held = k_uptime_get() < scan_hold_until; /* disconnect-storm backoff */
+    int64_t now = k_uptime_get();
+    bool held = now < scan_hold_until; /* disconnect-storm backoff */
     bool want_scan = is_enabled && slots_have_open() && !slots_connecting() && !held;
+
+    if (held && is_enabled && slots_have_open()) {
+        /* Guarantee a kick when the hold ends, whatever moved the deadline. */
+        k_work_reschedule(&delayed_scan_work, K_MSEC(scan_hold_until - now));
+    }
 
     if (!want_scan) {
         if (is_scanning) {
@@ -1244,7 +1249,9 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
         LOG_WRN("Rapid disconnect #%d — backing off %u ms",
                 consecutive_disconnect_count, delay);
         scan_hold_until = k_uptime_get() + delay;
-        k_work_schedule(&delayed_scan_work, K_MSEC(delay));
+        /* reschedule, not schedule: a later disconnect must move the deadline
+         * or the hold outlives the kick that was meant to end it */
+        k_work_reschedule(&delayed_scan_work, K_MSEC(delay));
     } else {
         link_mgr_kick();
     }
