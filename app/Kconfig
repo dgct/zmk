@@ -350,6 +350,17 @@ config ZMK_BLE_HOST_SUBRATING
       peripheral-side procedure is untested against real hosts.
 
 
+config ZMK_BLE_DEEP_IDLE_DELAY_MS
+    int "ZMK idle time before the deep-idle interval is requested (ms)"
+    default 60000
+    range 0 3600000
+    help
+      ZMK raises its idle state ZMK_IDLE_TIMEOUT after the last key, which
+      is a second on a keyboard with a trackpad. The deep-idle interval
+      costs the next key one long connection event and a parameter update
+      round trip, so it only follows this much longer idle period; until
+      then the link sits in Idle-1 (peripheral latency, no first-key cost).
+
 config ZMK_BLE_HID_IDLE_TIMEOUT_MS
     int "HID-silence window before raising latency to Idle-1 (ms)"
     default 5000

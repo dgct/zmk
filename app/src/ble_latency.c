@@ -121,6 +121,7 @@ static struct bt_conn *bg_conns[CONFIG_BT_MAX_CONN]; /* non-active-profile host 
 static uint16_t latency_state;
 static struct k_spinlock state_lock;
 static struct k_work_delayable idle_check_work;
+static struct k_work_delayable deep_idle_work;
 static struct k_work_delayable warmup_work;
 static struct k_work_delayable conn_update_timeout_work;
 static struct k_work background_idle_work;
@@ -506,6 +507,23 @@ static void request_idle_2(void) {
      * avoid blocking low-latency restore for the timeout duration. */
 }
 
+/* ZMK's idle state arrives about a second after the last key here (the
+ * trackpad and the display need it that early). The host link keeps its
+ * fast parameters through that. Idle-1 (latency 30: the peripheral still
+ * sends on any event, the host's own traffic waits) follows
+ * CONFIG_ZMK_BLE_HID_IDLE_TIMEOUT_MS without HID reports; the deep-idle
+ * interval, which does cost the next key one long event, follows only after
+ * CONFIG_ZMK_BLE_DEEP_IDLE_DELAY_MS of ZMK idle. */
+static void deep_idle_fn(struct k_work *work) {
+    ARG_UNUSED(work);
+    if (zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE) {
+        return;
+    }
+    state_set_bit(CONN_IN_DEEP_IDLE);
+    k_work_cancel_delayable(&idle_check_work);
+    request_idle_2();
+}
+
 static void idle_check_fn(struct k_work *work) {
     ARG_UNUSED(work);
     struct snapshot s = take_snapshot();
@@ -513,9 +531,6 @@ static void idle_check_fn(struct k_work *work) {
         return;
     }
     if (s.state & CONN_IN_DEEP_IDLE) {
-        return;
-    }
-    if (zmk_activity_get_state() != ZMK_ACTIVITY_ACTIVE) {
         return;
     }
     request_idle_1();
@@ -656,6 +671,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason) {
     k_spin_unlock(&state_lock, key);
     if (was_active) {
         k_work_cancel_delayable(&idle_check_work);
+        k_work_cancel_delayable(&deep_idle_work);
         k_work_cancel_delayable(&warmup_work);
         k_work_cancel_delayable(&conn_update_timeout_work);
 #if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
@@ -966,6 +982,7 @@ static int activity_event_listener(const zmk_event_t *eh) {
     }
     switch (ev->state) {
     case ZMK_ACTIVITY_ACTIVE:
+        k_work_cancel_delayable(&deep_idle_work);
         state_clear_bit(CONN_IN_DEEP_IDLE | CONN_CI_SETTLED);
         ci_retry_count = 0;
         if (prev_activity_state == ZMK_ACTIVITY_SLEEP &&
@@ -975,9 +992,8 @@ static int activity_event_listener(const zmk_event_t *eh) {
         request_low_latency();
         break;
     case ZMK_ACTIVITY_IDLE:
-        state_set_bit(CONN_IN_DEEP_IDLE);
-        k_work_cancel_delayable(&idle_check_work);
-        request_idle_2();
+        /* Idle-1 stays on the HID-silence timer; deep idle waits its delay. */
+        k_work_reschedule(&deep_idle_work, K_MSEC(CONFIG_ZMK_BLE_DEEP_IDLE_DELAY_MS));
         break;
     case ZMK_ACTIVITY_SLEEP:
         break;
@@ -1047,6 +1063,7 @@ static int profile_changed_listener(const zmk_event_t *eh) {
     if (swapped) {
         LOG_DBG("ble_latency: profile switch — reslotted active/background");
         k_work_cancel_delayable(&idle_check_work);
+        k_work_cancel_delayable(&deep_idle_work);
         k_work_cancel_delayable(&warmup_work);
         k_work_cancel_delayable(&conn_update_timeout_work);
 #if IS_ENABLED(CONFIG_ZMK_BLE_HOST_SUBRATING)
@@ -1203,6 +1220,7 @@ ZMK_SUBSCRIPTION(ble_latency_host_param, zmk_ble_host_param_request);
 
 static int ble_latency_init(void) {
     k_work_init_delayable(&idle_check_work, idle_check_fn);
+    k_work_init_delayable(&deep_idle_work, deep_idle_fn);
     k_work_init_delayable(&warmup_work, warmup_fn);
     k_work_init_delayable(&conn_update_timeout_work, conn_update_timeout_fn);
     k_work_init(&background_idle_work, background_idle_work_fn);
