@@ -82,6 +82,7 @@ struct peripheral_slot {
     struct k_work_delayable conn_process_work;
     /* GATT discovery watchdog — disconnects if discovery hangs */
     struct k_work_delayable discovery_timeout_work;
+    bool discovery_done; /* every required handle found and subscribed */
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct bt_gatt_subscribe_params batt_lvl_subscribe_params;
     struct bt_gatt_read_params batt_lvl_read_params;
@@ -256,6 +257,7 @@ int release_peripheral_slot(int index) {
         slot->conn = NULL;
     }
     slot->state = PERIPHERAL_SLOT_STATE_OPEN;
+    slot->discovery_done = false;
     k_mutex_unlock(&slots_lock);
 
     // Raise events releasing any active positions from this peripheral
@@ -786,6 +788,7 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
 
     if (subscribed) {
         /* GATT discovery completed — cancel watchdog */
+        slot->discovery_done = true;
         k_work_cancel_delayable(&slot->discovery_timeout_work);
     }
 
@@ -797,7 +800,10 @@ static void discovery_timeout_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct peripheral_slot *slot =
         CONTAINER_OF(dwork, struct peripheral_slot, discovery_timeout_work);
-    if (slot->conn && !slot->subscribe_params.value_handle) {
+    /* Every required handle, not just the position state: a link stuck
+     * after the first characteristic used to stay up with no behaviours
+     * and no layout, forever. */
+    if (slot->conn && !slot->discovery_done) {
         LOG_ERR("GATT discovery timed out after 5s — disconnecting");
         bt_conn_disconnect(slot->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
     }
@@ -843,11 +849,16 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
     struct peripheral_slot *slot =
         CONTAINER_OF(dwork, struct peripheral_slot, conn_process_work);
 
+    /* release_peripheral_slot() can run from a connection callback while
+     * this handler is on the work queue: take the reference under the lock
+     * and keep it for the whole run. */
+    k_mutex_lock(&slots_lock, K_FOREVER);
     if (slot->state != PERIPHERAL_SLOT_STATE_CONNECTED || slot->conn == NULL) {
+        k_mutex_unlock(&slots_lock);
         return;
     }
-
-    struct bt_conn *conn = slot->conn;
+    struct bt_conn *conn = bt_conn_ref(slot->conn);
+    k_mutex_unlock(&slots_lock);
     int err;
 
     LOG_DBG("Current security for connection: %d", bt_conn_get_security(conn));
@@ -857,6 +868,7 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
      * security_changed will re-schedule us when encryption completes. */
     if (bt_conn_get_security(conn) < BT_SECURITY_L2) {
         LOG_WRN("GATT discovery deferred: encryption not yet established");
+        bt_conn_unref(conn);
         return;
     }
 
@@ -867,7 +879,7 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
         slot->discover_params.end_handle = 0xffff;
         slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
 
-        err = bt_gatt_discover(slot->conn, &slot->discover_params);
+        err = bt_gatt_discover(conn, &slot->discover_params);
         if (err) {
             // Bug B: previously only -ENOMEM was retried; any other error
             // (e.g. -ENOTCONN if ATT bearer isn't ready yet) left the
@@ -878,12 +890,14 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
                 LOG_ERR("Discover failed after %d retries (err %d), disconnecting",
                         MAX_CONN_PROCESS_RETRIES, err);
                 slot->conn_process_retries = 0;
-                bt_conn_disconnect(slot->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+                bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+                bt_conn_unref(conn);
                 return;
             }
             LOG_WRN("Discover failed (err %d), retry %d/%d", err,
                     slot->conn_process_retries, MAX_CONN_PROCESS_RETRIES);
             k_work_schedule(&slot->conn_process_work, K_MSEC(5));
+            bt_conn_unref(conn);
             return;
         }
         slot->conn_process_retries = 0;
@@ -891,6 +905,7 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
         /* Arm 5s GATT discovery watchdog. Cancelled by
          * release_peripheral_slot() on disconnect or by the
          * chrc_discovery_func when all subscriptions complete. */
+        slot->discovery_done = false;
         k_work_schedule(&slot->discovery_timeout_work, K_SECONDS(5));
     }
 
@@ -903,6 +918,7 @@ static void split_central_process_connection_work_handler(struct k_work *work) {
 
     // Restart scanning if necessary.
     link_mgr_kick();
+    bt_conn_unref(conn);
 }
 
 static int stop_scanning(void) {
