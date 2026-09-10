@@ -79,10 +79,11 @@ static K_WORK_DELAYABLE_DEFINE(wdt_feed_dw, wdt_feed_work_fn);
 void k_sys_fatal_error_handler(unsigned int reason,
 			       const struct arch_esf *esf)
 {
-	ARG_UNUSED(reason);
-
+	/* K_ERR_* code: CPU exception 0, spurious IRQ 1, stack check 2, oops 3,
+	 * panic 4.  CFSR has been cleared by Zephyr's fault handling by the
+	 * time this runs; HFSR and the reason are what carry the cause. */
 	crash_info.magic  = CRASH_MAGIC;
-	crash_info.source = 0;
+	crash_info.source = reason;
 	crash_info.cfsr   = SCB->CFSR;
 	crash_info.hfsr   = SCB->HFSR;
 	crash_info.icsr   = SCB->ICSR;
@@ -123,8 +124,11 @@ static void crash_report_work_fn(struct k_work *w)
 		(saved_resetreas & 0x100000)  ? " VBUS"   : "");
 
 	if (have_crash) {
-		const char *src = saved_crash.source ? "WDT" : "FAULT";
-
+		static const char *const reasons[] = {"CPU exception", "spurious IRQ",
+		                                      "stack check failed", "kernel oops",
+		                                      "kernel panic"};
+		const char *src = saved_crash.source < ARRAY_SIZE(reasons)
+		                      ? reasons[saved_crash.source] : "unknown";
 		LOG_ERR("CRASH[%s]: PC=0x%08x LR=0x%08x PSR=0x%08x",
 			src, saved_crash.pc, saved_crash.lr, saved_crash.psr);
 		LOG_ERR("CRASH: CFSR=0x%08x HFSR=0x%08x ICSR=0x%08x",

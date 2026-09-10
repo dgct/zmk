@@ -54,33 +54,23 @@ static uint8_t lithium_ion_mv_to_pct(int16_t bat_mv) {
 #endif // IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING_FETCH_MODE_LITHIUM_VOLTAGE)
 
 #if IS_ENABLED(CONFIG_BT_BAS)
-#define BAS_NOTIFY_MAX_RETRIES 5
-#define BAS_NOTIFY_RETRY_MS 200
-
-static uint8_t bas_notify_retries;
-
 static void zmk_battery_bas_notify_work_cb(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(battery_bas_notify_work, zmk_battery_bas_notify_work_cb);
 
+/* On the system work queue, where the GATT notify is allowed to wait for a
+ * buffer.  No retry: bt_bas_set_battery_level() stores the level before it
+ * notifies (so a retry always found it already set) and maps a host that is
+ * not subscribed to success; its only error is a level above 100. */
 static void zmk_battery_bas_notify_work_cb(struct k_work *work) {
     uint8_t level = last_state_of_charge;
     if (bt_bas_get_battery_level() == level) {
-        bas_notify_retries = 0;
         return;
     }
     LOG_DBG("Setting BAS GATT battery level to %d.", level);
     int rc = bt_bas_set_battery_level(level);
-    if (rc == -EINVAL && bas_notify_retries < BAS_NOTIFY_MAX_RETRIES) {
-        bas_notify_retries++;
-        LOG_DBG("BAS notify: host not subscribed, retry %d/%d",
-                bas_notify_retries, BAS_NOTIFY_MAX_RETRIES);
-        k_work_reschedule(&battery_bas_notify_work, K_MSEC(BAS_NOTIFY_RETRY_MS));
-        return;
-    }
     if (rc != 0) {
         LOG_WRN("Failed to set BAS GATT battery level (err %d)", rc);
     }
-    bas_notify_retries = 0;
 }
 #endif
 
@@ -213,6 +203,11 @@ static int battery_event_listener(const zmk_event_t *eh) {
     {
         const struct zmk_split_peripheral_status_changed *p_ev =
             as_zmk_split_peripheral_status_changed(eh);
+        if (p_ev != NULL && !p_ev->connected) {
+            /* Handled (nothing to do): a negative return here would end the
+             * event's dispatch for every later subscriber. */
+            return ZMK_EV_EVENT_BUBBLE;
+        }
         if (p_ev != NULL && p_ev->connected) {
             /* Force an immediate battery sample on every central reconnect.
              * Without this, the central sees the cached BAS value (often

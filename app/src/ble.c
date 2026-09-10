@@ -726,15 +726,10 @@ static bool pairing_allowed_for_current_profile(struct bt_conn *conn) {
         return true;
     }
 
-    // If the peer's address is an RPA that wasn't resolved (bond keys failed
-    // to load from NVS), we can't verify identity via address comparison.
-    // Allow re-pairing so the bond can be re-established.
-    if (bt_addr_le_is_rpa(dst)) {
-        LOG_WRN("Allowing re-pair on profile %d: peer RPA could not be resolved "
-                "(bond keys may be missing from NVS)", active_profile);
-        return true;
-    }
-
+    // An unresolved RPA is not evidence of a lost bond: every modern host and
+    // every stranger presents one.  Accepting it here let any Just Works
+    // peer in range pair onto a taken profile and receive the keystrokes.  A
+    // host that lost its keys pairs again once the profile is cleared.
     return false;
 }
 

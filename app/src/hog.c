@@ -338,6 +338,38 @@ static struct zmk_hid_mouse_report_body mouse_coalesce;
 static bool mouse_coalesce_pending;
 static struct k_spinlock mouse_coalesce_lock;
 
+/* Reports whose buttons differ must not merge: a press and a release that
+ * both arrive while one notify is in flight would otherwise collapse into
+ * the release alone, and the host would never see the click.  A button
+ * transition therefore closes the coalesce buffer into this sequence
+ * (oldest first) and starts a new one; the sender drains the sequence
+ * before the buffer.  Only when four transitions are already waiting does a
+ * new one merge, as everything did before. */
+#define HOG_MOUSE_SEQ_LEN 4
+static struct zmk_hid_mouse_report_body mouse_seq[HOG_MOUSE_SEQ_LEN];
+static uint8_t mouse_seq_head;
+static uint8_t mouse_seq_count;
+
+/* Under mouse_coalesce_lock: close the pending coalesce buffer into the
+ * sequence.  Returns false, leaving the buffer pending, when it is full. */
+static bool mouse_seq_push_locked(void) {
+    if (!mouse_coalesce_pending || mouse_seq_count >= HOG_MOUSE_SEQ_LEN) {
+        return false;
+    }
+    mouse_seq[(mouse_seq_head + mouse_seq_count) % HOG_MOUSE_SEQ_LEN] = mouse_coalesce;
+    mouse_seq_count++;
+    mouse_coalesce_pending = false;
+    return true;
+}
+
+/* Under mouse_coalesce_lock: forget every pending report. */
+static void mouse_pending_clear_locked(void) {
+    mouse_coalesce = (struct zmk_hid_mouse_report_body){0};
+    mouse_coalesce_pending = false;
+    mouse_seq_head = 0;
+    mouse_seq_count = 0;
+}
+
 /**
  * Merge a failed report's deltas back into the coalesce buffer.
  * If a new report arrived between our snapshot-clear and this restore,
@@ -346,7 +378,13 @@ static struct k_spinlock mouse_coalesce_lock;
  */
 static void mouse_coalesce_restore(const struct zmk_hid_mouse_report_body *report) {
     k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
-    if (mouse_coalesce_pending) {
+    if (mouse_seq_count < HOG_MOUSE_SEQ_LEN) {
+        /* Back to the front of the line, ahead of everything that arrived
+         * since the snapshot, so the order of button transitions holds. */
+        mouse_seq_head = (uint8_t)((mouse_seq_head + HOG_MOUSE_SEQ_LEN - 1) % HOG_MOUSE_SEQ_LEN);
+        mouse_seq[mouse_seq_head] = *report;
+        mouse_seq_count++;
+    } else if (mouse_coalesce_pending) {
         int32_t x = (int32_t)mouse_coalesce.d_x + report->d_x;
         int32_t y = (int32_t)mouse_coalesce.d_y + report->d_y;
         int32_t sx = (int32_t)mouse_coalesce.d_scroll_x + report->d_scroll_x;
@@ -595,15 +633,20 @@ void send_mouse_report_callback(struct k_work *work) {
         }
 
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-        /* Snapshot and clear the coalesce buffer. */
+        /* Oldest closed report first, then a snapshot of the coalesce buffer. */
         {
             k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
-            if (!mouse_coalesce_pending) {
+            if (mouse_seq_count > 0) {
+                report = mouse_seq[mouse_seq_head];
+                mouse_seq_head = (uint8_t)((mouse_seq_head + 1) % HOG_MOUSE_SEQ_LEN);
+                mouse_seq_count--;
+            } else if (!mouse_coalesce_pending) {
                 k_spin_unlock(&mouse_coalesce_lock, key);
                 return;
+            } else {
+                report = mouse_coalesce;
+                mouse_coalesce_pending = false;
             }
-            report = mouse_coalesce;
-            mouse_coalesce_pending = false;
             k_spin_unlock(&mouse_coalesce_lock, key);
         }
 #else
@@ -636,15 +679,15 @@ void send_mouse_report_callback(struct k_work *work) {
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
         if (err == -ENOMEM || err == -EINVAL || err == -EPERM) {
+            if (err == -EPERM) {
+                bt_conn_set_security(conn, BT_SECURITY_L2);
+            }
             bt_conn_unref(conn);
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
             /* Roll back optimistic increment — completion CB won't fire. */
             atomic_dec(&mouse_in_flight);
             mouse_coalesce_restore(&report);
 #endif
-            if (err == -EPERM) {
-                bt_conn_set_security(conn, BT_SECURITY_L2);
-            }
             if (++hog_mouse_retries > HOG_NOTIFY_MAX_RETRIES) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
                 LOG_WRN("Mouse pipeline: notify exhaustion after %d retries (err %d), "
@@ -685,6 +728,9 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
      * and clears it when a pipeline slot is available. Under backpressure,
      * deltas sum into one report instead of queueing individually. */
     k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
+    if (mouse_coalesce_pending && report->buttons != mouse_coalesce.buttons) {
+        (void)mouse_seq_push_locked(); /* a button transition is a boundary */
+    }
     if (mouse_coalesce_pending) {
         int32_t x = (int32_t)mouse_coalesce.d_x + report->d_x;
         int32_t y = (int32_t)mouse_coalesce.d_y + report->d_y;
@@ -731,10 +777,10 @@ void zmk_hog_mouse_clear_queue(void) {
     hog_mouse_retries = 0;
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
     k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
-    mouse_coalesce = (struct zmk_hid_mouse_report_body){0};
-    mouse_coalesce_pending = false;
+    mouse_pending_clear_locked();
     k_spin_unlock(&mouse_coalesce_lock, key);
-    atomic_clear(&mouse_in_flight);
+    /* mouse_in_flight is left to its completions: the notifies already
+     * handed to the host stack still complete and decrement it. */
 #endif
 }
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
@@ -793,23 +839,25 @@ static void hog_host_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     LOG_INF("HOG host disconnect (reason 0x%02x), clearing HID state", reason);
 
+    /* Only the active profile's link carries notifies and the global HID
+     * state.  A background profile dropping must not wipe either, and must
+     * not touch the in-flight count: ATT skips the completion callback for
+     * notifies on a link that shut down, so the count is cleared for the
+     * active link only, where those callbacks are the ones that will never
+     * come. */
+    bt_addr_le_t *active_addr = zmk_ble_active_profile_addr();
+    if (active_addr == NULL || !bt_addr_le_eq(info.le.dst, active_addr)) {
+        return;
+    }
 #if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
     {
         k_spinlock_key_t key = k_spin_lock(&mouse_coalesce_lock);
-        mouse_coalesce = (struct zmk_hid_mouse_report_body){0};
-        mouse_coalesce_pending = false;
+        mouse_pending_clear_locked();
         k_spin_unlock(&mouse_coalesce_lock, key);
     }
     atomic_clear(&mouse_in_flight);
 #endif
-
-    /* Only clear the global HID register state if the dropped connection
-     * was the active profile's link. Other (background) profile links
-     * dropping must not wipe state shared with the active host. */
-    bt_addr_le_t *active_addr = zmk_ble_active_profile_addr();
-    if (active_addr != NULL && bt_addr_le_eq(info.le.dst, active_addr)) {
-        zmk_endpoint_clear_reports();
-    }
+    zmk_endpoint_clear_reports();
 }
 
 BT_CONN_CB_DEFINE(hog_conn_callbacks) = {

@@ -1612,6 +1612,19 @@ static int split_central_bt_set_enabled(bool enabled) {
     } else {
         int err;
 
+        /* The sleep listener runs on the system work queue and the sleep
+         * path calls sys_poweroff() right after the listeners return, so
+         * the manager work queued above never runs: stop the scanner here,
+         * synchronously, and cancel its restarts, or System OFF is entered
+         * with the scanner running. */
+        k_work_cancel_delayable(&delayed_scan_work);
+        k_work_cancel_delayable(&scan_slow_work);
+        err = stop_scanning();
+        if (err < 0) {
+            LOG_WRN("Failed to stop scanning before disabling (%d)", err);
+            k_work_cancel_delayable(&delayed_scan_work);
+        }
+
         for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
             if (peripherals[i].state != PERIPHERAL_SLOT_STATE_CONNECTED) {
                 continue;

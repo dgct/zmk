@@ -110,6 +110,10 @@ static uint8_t last_applied_map[5];
  * adaptive interval can drop to fast; the atomic_cas gate bounds wakeups
  * to at most one per cycle.
  */
+BUILD_ASSERT(!IS_ENABLED(CONFIG_BT_CTLR_ZLI),
+             "zmk_qos_crc_report() runs in the radio ISR and calls k_wakeup(): not "
+             "permitted from a zero-latency interrupt");
+
 void zmk_qos_crc_report(uint16_t handle, uint8_t chan, bool crc_ok)
 {
 	ARG_UNUSED(handle);
