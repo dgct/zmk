@@ -134,7 +134,6 @@ static int zmk_battery_update(const struct device *battery) {
         // any thread that isn't sysworkq, so calling it directly from
         // lowprio_work_q would silently freeze that queue (and any work
         // sharing it, e.g. RGB underglow) when the ATT TX pool is exhausted.
-        bas_notify_retries = 0;
         k_work_reschedule(&battery_bas_notify_work, K_NO_WAIT);
     }
 #endif

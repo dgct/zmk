@@ -1618,8 +1618,7 @@ static int split_central_bt_set_enabled(bool enabled) {
          * synchronously, and cancel its restarts, or System OFF is entered
          * with the scanner running. */
         k_work_cancel_delayable(&delayed_scan_work);
-        k_work_cancel_delayable(&scan_slow_work);
-        err = stop_scanning();
+        err = stop_scanning(); /* also cancels the scan back-off work */
         if (err < 0) {
             LOG_WRN("Failed to stop scanning before disabling (%d)", err);
             k_work_cancel_delayable(&delayed_scan_work);
