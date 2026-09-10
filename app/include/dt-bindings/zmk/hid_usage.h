@@ -1622,10 +1622,10 @@
 #define HID_USAGE_SENSORS_OTHER_GENERIC_ENUMERATOR (0xE3)                              // CA, CP
 #define HID_USAGE_SENSORS_OTHER_HINGE_ANGLE (0xE4)                                     // CA, CP
 #define HID_USAGE_SENSORS_EVENT (0x200)                                                // DV
-#define HID_USAGE_SENSORS_EVENT_SENSOR_STATE (0x201)                                   // NAry
+#define HID_USAGE_SENSORS_EVENT_SENSOR_STATE 0x201                                   // NAry
 #define HID_USAGE_SENSORS_EVENT_SENSOR_EVENT (0x202)                                   // NAry
 #define HID_USAGE_SENSORS_PROPERTY (0x300)                                             // DV
-#define HID_USAGE_SENSORS_PROPERTY_FRIENDLY_NAME (0x301)                               // SV
+#define HID_USAGE_SENSORS_PROPERTY_FRIENDLY_NAME 0x301                               // SV
 #define HID_USAGE_SENSORS_PROPERTY_PERSISTENT_UNIQUE_ID (0x302)                        // DV
 #define HID_USAGE_SENSORS_PROPERTY_SENSOR_STATUS (0x303)                               // DV
 #define HID_USAGE_SENSORS_PROPERTY_MINIMUM_REPORT_INTERVAL (0x304)                     // SV
@@ -1928,13 +1928,13 @@
 #define HID_USAGE_SENSORS_DATA_FIELD_HINGE_FOLD_FINAL_ANGLE (0x5F3)                    // SV
 #define HID_USAGE_SENSORS_DATA_FIELD_HINGE_FOLD_CONTRIBUTING_PANEL (0x5F4)             // NAry
 #define HID_USAGE_SENSORS_DATA_FIELD_HINGE_FOLD_TYPE (0x5F5)                           // NAry
-#define HID_USAGE_SENSORS_SENSOR_STATE_UNDEFINED (0x800)                               // Sel
-#define HID_USAGE_SENSORS_SENSOR_STATE_READY (0x801)                                   // Sel
-#define HID_USAGE_SENSORS_SENSOR_STATE_NOT_AVAILABLE (0x802)                           // Sel
-#define HID_USAGE_SENSORS_SENSOR_STATE_NO_DATA (0x803)                                 // Sel
-#define HID_USAGE_SENSORS_SENSOR_STATE_INITIALIZING (0x804)                            // Sel
-#define HID_USAGE_SENSORS_SENSOR_STATE_ACCESS_DENIED (0x805)                           // Sel
-#define HID_USAGE_SENSORS_SENSOR_STATE_ERROR (0x806)                                   // Sel
+#define HID_USAGE_SENSORS_SENSOR_STATE_UNDEFINED 0x800                               // Sel
+#define HID_USAGE_SENSORS_SENSOR_STATE_READY 0x801                                   // Sel
+#define HID_USAGE_SENSORS_SENSOR_STATE_NOT_AVAILABLE 0x802                           // Sel
+#define HID_USAGE_SENSORS_SENSOR_STATE_NO_DATA 0x803                                 // Sel
+#define HID_USAGE_SENSORS_SENSOR_STATE_INITIALIZING 0x804                            // Sel
+#define HID_USAGE_SENSORS_SENSOR_STATE_ACCESS_DENIED 0x805                           // Sel
+#define HID_USAGE_SENSORS_SENSOR_STATE_ERROR 0x806                                   // Sel
 #define HID_USAGE_SENSORS_SENSOR_EVENT_UNKNOWN (0x810)                                 // Sel
 #define HID_USAGE_SENSORS_SENSOR_EVENT_STATE_CHANGED (0x811)                           // Sel
 #define HID_USAGE_SENSORS_SENSOR_EVENT_PROPERTY_CHANGED (0x812)                        // Sel

@@ -2,24 +2,24 @@
  * crash_capture.c — Captures crash/lockup context into retained (.noinit) RAM,
  * then reports it on next boot.
  *
- * Three mechanisms:
+ * Two mechanisms:
  *
- * 1. __wrap_z_arm_nmi (naked asm) — WDT timeout fires NMI.  The naked stub
- *    reads EXC_RETURN to determine which stack (MSP/PSP) holds the
- *    interrupted context, then tail-calls crash_nmi_c() with a pointer to
- *    the exception frame.  This gives the EXACT PC of the stuck code.
- *
- * 2. k_sys_fatal_error_handler override — captures PC/LR/CFSR from the
+ * 1. k_sys_fatal_error_handler override — captures PC/LR/CFSR from the
  *    Zephyr exception stack frame on hard faults, bus faults, etc.
  *
- * 3. crash_capture_init (SYS_INIT) — on boot, reads RESETREAS and checks
+ * 2. crash_capture_init (SYS_INIT) — on boot, reads RESETREAS and checks
  *    .noinit for a crash record.  Logs both.  Then arms the HW WDT (8 s)
  *    and starts a workqueue feeder (every 3 s).
  *
+ * The hardware watchdog itself leaves no program counter: the nRF52840 WDT
+ * has no NMI, so an expiry with interrupts locked resets the chip with only
+ * RESETREAS.DOG to show for it (an earlier NMI wrapper here could never
+ * run).  A stalled system work queue with interrupts alive is caught first
+ * by the task watchdog, whose callback in fault_record.c records the
+ * interrupted PC.
+ *
  * After reboot, decode the logged PC with:
  *   arm-none-eabi-addr2line -e build/right/zephyr/zephyr.elf 0x<PC>
- *
- * Linker requirement: -Wl,--wrap=z_arm_nmi  (added in CMakeLists.txt)
  */
 
 #include <zephyr/kernel.h>
@@ -46,7 +46,7 @@ struct crash_data {
 	uint32_t cfsr;    /* Configurable Fault Status Register             */
 	uint32_t hfsr;    /* HardFault Status Register                      */
 	uint32_t icsr;    /* Interrupt Control / State Register              */
-	uint32_t source;  /* 0 = fault  |  1 = WDT NMI                     */
+	uint32_t source;  /* 0 = fault (1 was the never-taken WDT NMI path) */
 };
 
 static volatile struct crash_data __attribute__((section(".noinit")))
@@ -71,53 +71,6 @@ static void wdt_feed_work_fn(struct k_work *w)
 }
 
 static K_WORK_DELAYABLE_DEFINE(wdt_feed_dw, wdt_feed_work_fn);
-
-/* ------------------------------------------------------------------ */
-/* NMI handler — WDT timeout captures the interrupted PC              */
-/* ------------------------------------------------------------------ */
-
-/*
- * C handler: receives a pointer to the hardware exception frame that
- * the NMI interrupted.  Frame layout (Cortex-M4):
- *   [0]=R0  [1]=R1  [2]=R2  [3]=R3  [4]=R12  [5]=LR  [6]=PC  [7]=xPSR
- */
-void __used crash_nmi_c(uint32_t *frame)
-{
-	crash_info.magic  = CRASH_MAGIC;
-	crash_info.pc     = frame[6];
-	crash_info.lr     = frame[5];
-	crash_info.psr    = frame[7];
-	crash_info.cfsr   = SCB->CFSR;
-	crash_info.hfsr   = SCB->HFSR;
-	crash_info.icsr   = SCB->ICSR;
-	crash_info.source = 1;
-
-	/* Spin; the WDT hardware will reset the chip in ~61 µs. */
-	for (;;) {
-		__NOP();
-	}
-}
-
-/*
- * Naked NMI entry — linked via  -Wl,--wrap=z_arm_nmi  so the vector
- * table calls us instead of Zephyr's default z_arm_nmi().
- *
- * At NMI entry LR holds EXC_RETURN.  Bit 2 tells us which stack
- * contains the interrupted context's exception frame:
- *   0 → MSP  (interrupted handler / ISR)
- *   1 → PSP  (interrupted thread)
- */
-__attribute__((naked))
-void __wrap_z_arm_nmi(void)
-{
-	__asm volatile(
-		"tst   lr, #4            \n"
-		"ite   eq                \n"
-		"mrseq r0, msp           \n"
-		"mrsne r0, psp           \n"
-		"b     crash_nmi_c       \n"
-	);
-}
 
 /* ------------------------------------------------------------------ */
 /* Fatal error handler — faults (HardFault, BusFault, …)              */
@@ -229,7 +182,15 @@ static int crash_capture_init(void)
 		return 0;
 	}
 
-	int err = wdt_setup(wdt_dev, WDT_OPT_PAUSE_IN_SLEEP);
+	/* The watchdog keeps counting while the CPU sleeps: a system whose
+	 * threads are all blocked, or that spins with interrupts locked in a
+	 * WFE loop (a refused System OFF), idles the CPU exactly like a healthy
+	 * one.  With the watchdog paused in sleep such a state lasted until the
+	 * battery died; now it ends in a reset with RESETREAS.DOG set.  The
+	 * feeder below still runs on the system work queue every 3 s while the
+	 * kernel is alive, and System OFF stops the watchdog with everything
+	 * else, so a healthy keyboard is never reset by this. */
+	int err = wdt_setup(wdt_dev, 0);
 	if (err) {
 		LOG_ERR("WDT: setup failed %d", err);
 		return 0;

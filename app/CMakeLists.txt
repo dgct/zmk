@@ -25,8 +25,6 @@ zephyr_syscall_header(${APPLICATION_SOURCE_DIR}/include/drivers/ext_power.h)
 target_include_directories(app PRIVATE include)
 add_subdirectory(src/boot)
 
-# Wrap z_arm_nmi so crash_capture's NMI handler runs on WDT timeout
-zephyr_link_libraries_ifdef(CONFIG_WATCHDOG -Wl,--wrap=z_arm_nmi)
 target_sources(app PRIVATE src/stdlib.c)
 target_sources(app PRIVATE src/activity.c)
 target_sources_ifdef(CONFIG_WATCHDOG app PRIVATE src/crash_capture.c)

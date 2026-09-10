@@ -97,9 +97,11 @@
 #define HID_PHYSICAL_MAX8(a) HID_ITEM(HID_ITEM_TAG_PHYSICAL_MAX, HID_ITEM_TYPE_GLOBAL, 1), a
 #endif
 
-#define HID_USAGE16(a, b) HID_ITEM(HID_ITEM_TAG_USAGE, HID_ITEM_TYPE_LOCAL, 2), a, b
+/* Zephyr's usb/class/hid.h defines a one-argument HID_USAGE16; this one takes the
+ * two bytes and must not collide with it. */
+#define ZMK_HID_USAGE16(a, b) HID_ITEM(HID_ITEM_TAG_USAGE, HID_ITEM_TYPE_LOCAL, 2), a, b
 
-#define HID_USAGE16_SINGLE(a) HID_USAGE16((a & 0xFF), ((a >> 8) & 0xFF))
+#define ZMK_HID_USAGE16_SINGLE(a) ZMK_HID_USAGE16((a & 0xFF), ((a >> 8) & 0xFF))
 
 static const uint8_t zmk_hid_report_desc[] = {
     HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
@@ -241,7 +243,7 @@ static const uint8_t zmk_hid_report_desc[] = {
     HID_FEATURE(ZMK_HID_MAIN_VAL_DATA | ZMK_HID_MAIN_VAL_VAR | ZMK_HID_MAIN_VAL_ABS),
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
     HID_USAGE_PAGE(HID_USAGE_CONSUMER),
-    HID_USAGE16_SINGLE(HID_USAGE_CONSUMER_AC_PAN),
+    ZMK_HID_USAGE16_SINGLE(HID_USAGE_CONSUMER_AC_PAN),
     HID_LOGICAL_MIN16(0x00, 0x80),
     HID_LOGICAL_MAX16(0xFF, 0x7F),
     HID_PHYSICAL_MIN8(0x00),
