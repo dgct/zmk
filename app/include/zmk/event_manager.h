@@ -57,8 +57,11 @@ struct zmk_event_subscription {
         return ZMK_EVENT_RAISE(ev);                                                                \
     };                                                                                             \
     struct event_type *as_##event_type(const zmk_event_t *eh) {                                    \
-        return (eh->event == &zmk_event_##event_type) ? &((struct event_type##_event *)eh)->data   \
-                                                      : NULL;                                      \
+        /* NULL in, NULL out: ZMK_DISPLAY_WIDGET_LISTENER's init refreshes every widget with a    \
+         * NULL event, and the widgets' state getters hand that straight to this helper. */       \
+        return (eh != NULL && eh->event == &zmk_event_##event_type)                                \
+                   ? &((struct event_type##_event *)eh)->data                                      \
+                   : NULL;                                                                         \
     };
 
 #define ZMK_LISTENER(mod, cb) const struct zmk_listener zmk_listener_##mod = {.callback = cb};
