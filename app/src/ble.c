@@ -726,10 +726,33 @@ static bool pairing_allowed_for_current_profile(struct bt_conn *conn) {
         return true;
     }
 
-    // An unresolved RPA is not evidence of a lost bond: every modern host and
-    // every stranger presents one.  Accepting it here let any Just Works
-    // peer in range pair onto a taken profile and receive the keystrokes.  A
-    // host that lost its keys pairs again once the profile is cleared.
+    // The profile is taken and this is not its owner's address: either a host
+    // that lost or replaced its identity, or a stranger.  No address test can
+    // tell those apart, which is why the old `bt_addr_le_is_rpa(dst)` clause
+    // admitted everyone -- every unknown peer in radio range presents an RPA.
+    // Two other things can.
+
+    // Authenticated pairing puts the user in the loop.  With MITM protection
+    // enforced, the peer reaches the profile only once the passkey shown on its
+    // screen has been typed on this keyboard, so taking a profile over needs
+    // the keyboard in hand and is no longer something radio range alone buys.
+    if (IS_ENABLED(CONFIG_BT_SMP_ENFORCE_MITM)) {
+        return true;
+    }
+
+#if IS_ENABLED(CONFIG_BT_SMP)
+    // Where pairing may be unauthenticated, admit it only onto a profile whose
+    // keys are already gone -- evicted once the store filled at BT_MAX_PAIRED,
+    // or left behind by a partial settings wipe.  Such a profile has nothing
+    // left to protect and its address can never match again, which is the case
+    // the old clause was actually reaching for.
+    if (!bt_le_bond_exists(BT_ID_DEFAULT, profile_addr)) {
+        LOG_WRN("Profile %d holds an address with no bond behind it; allowing the re-pair",
+                active_profile);
+        return true;
+    }
+#endif
+
     return false;
 }
 
