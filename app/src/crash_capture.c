@@ -8,7 +8,7 @@
  *    Zephyr exception stack frame on hard faults, bus faults, etc.
  *
  * 2. crash_capture_init (SYS_INIT) — on boot, reads RESETREAS and checks
- *    .noinit for a crash record.  Logs both.  Then arms the HW WDT (8 s)
+ *    .noinit for a crash record.  Logs both.  Then arms the HW WDT (12 s)
  *    and starts a workqueue feeder (every 3 s).
  *
  * The hardware watchdog itself leaves no program counter: the nRF52840 WDT
@@ -26,6 +26,8 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/logging/log.h>
+
+#include <zmk/crash_capture.h>
 #include <zephyr/fatal.h>
 #include <zephyr/arch/cpu.h>
 #include <hal/nrf_power.h>
@@ -71,6 +73,20 @@ static void wdt_feed_work_fn(struct k_work *w)
 }
 
 static K_WORK_DELAYABLE_DEFINE(wdt_feed_dw, wdt_feed_work_fn);
+
+/* ------------------------------------------------------------------ */
+/* Board hook — see zmk/crash_capture.h                               */
+/* ------------------------------------------------------------------ */
+
+__weak void zmk_crash_capture_boot_record(uint32_t reason, uint32_t pc, uint32_t lr,
+					  uint32_t cfsr, uint32_t hfsr)
+{
+	ARG_UNUSED(reason);
+	ARG_UNUSED(pc);
+	ARG_UNUSED(lr);
+	ARG_UNUSED(cfsr);
+	ARG_UNUSED(hfsr);
+}
 
 /* ------------------------------------------------------------------ */
 /* Fatal error handler — faults (HardFault, BusFault, …)              */
@@ -142,7 +158,7 @@ static void crash_report_work_fn(struct k_work *w)
 		}
 	}
 
-	LOG_ERR("WDT: armed 8s, feed 3s");
+	LOG_ERR("WDT: armed 12s, feed 3s");
 }
 
 static K_WORK_DELAYABLE_DEFINE(crash_report_dw, crash_report_work_fn);
@@ -162,12 +178,18 @@ static int crash_capture_init(void)
 		saved_crash = *(const struct crash_data *)&crash_info;
 		have_crash = true;
 		crash_info.magic = 0; /* clear sentinel */
+
+		/* Give the board a chance to store this somewhere that outlives
+		 * .noinit.  The report below needs a log backend, and the
+		 * production images build without one. */
+		zmk_crash_capture_boot_record(saved_crash.source, saved_crash.pc, saved_crash.lr,
+					      saved_crash.cfsr, saved_crash.hfsr);
 	}
 
 	/* ---- 3. Schedule deferred report (35 s — USB CDC is up by then) */
 	k_work_reschedule(&crash_report_dw, K_SECONDS(35));
 
-	/* ---- 4. Arm hardware watchdog (8 s timeout) ---- */
+	/* ---- 4. Arm hardware watchdog (12 s timeout) ---- */
 	wdt_dev = DEVICE_DT_GET(DT_NODELABEL(wdt0));
 	if (!device_is_ready(wdt_dev)) {
 		LOG_ERR("WDT: device not ready");
@@ -175,8 +197,20 @@ static int crash_capture_init(void)
 		return 0;
 	}
 
+	/* 12 s, not 8, so this watchdog loses the race it should lose.  The task
+	 * watchdog in the board's fault_record.c watches the same system work
+	 * queue on an 8 s channel fed every 500 ms from a k_timer, so it still
+	 * runs when the queue is blocked, and its callback is what records which
+	 * channel expired and the PC of the handler that stalled it.  This one
+	 * has no callback -- the hardware resets the chip and leaves only
+	 * RESETREAS.DOG -- and it is fed from the blocked queue itself every 3 s.
+	 * At an 8 s window it could fire 5 s into a stall and beat the task
+	 * watchdog's 7.5 s, throwing the attribution away; at 12 s the earliest
+	 * it can fire is 9 s, which leaves 1.5 s to record and reboot.  An
+	 * interrupt-locked spin, which the task watchdog's timer cannot escape,
+	 * still ends here. */
 	struct wdt_timeout_cfg cfg = {
-		.window = { .min = 0, .max = 8000 },
+		.window = { .min = 0, .max = 12000 },
 		.callback = NULL,
 	};
 
@@ -204,7 +238,7 @@ static int crash_capture_init(void)
 	wdt_feed(wdt_dev, wdt_ch);
 	k_work_reschedule(&wdt_feed_dw, K_SECONDS(3));
 
-	LOG_ERR("WDT: armed 8s, feed 3s");
+	LOG_ERR("WDT: armed 12s, feed 3s");
 	return 0;
 }
 
