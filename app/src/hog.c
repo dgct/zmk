@@ -331,9 +331,25 @@ BT_GATT_SERVICE_DEFINE(
  * in the BLE controller. Each bt_gatt_notify_cb() increments; each
  * hog_notify_complete() decrements. When the counter reaches PIPELINE_SIZE,
  * new reports coalesce in mouse_coalesce until a completion fires.
+ *
+ * A slot is returned only by a completion callback, and ATT does not deliver
+ * those for notifies still outstanding when a link goes down: bt_att_released()
+ * nulls the channel and att_on_sent_cb() then drops the callback.  Every path
+ * that can lose a completion therefore has to return the slots itself --
+ * hog_host_disconnected() does, for any link -- and the releases below
+ * saturate at zero, so returning a slot twice cannot push the count negative
+ * and silently unbound the pipeline.
  */
 #define HOG_MOUSE_PIPELINE_SIZE CONFIG_ZMK_HOG_MOUSE_PIPELINE_SIZE
 static atomic_t mouse_in_flight;
+
+/* Return one pipeline slot, never going below zero. */
+static void mouse_in_flight_release(void) {
+    atomic_val_t v = atomic_get(&mouse_in_flight);
+    while (v > 0 && !atomic_cas(&mouse_in_flight, v, v - 1)) {
+        v = atomic_get(&mouse_in_flight);
+    }
+}
 static struct zmk_hid_mouse_report_body mouse_coalesce;
 static bool mouse_coalesce_pending;
 static struct k_spinlock mouse_coalesce_lock;
@@ -407,7 +423,7 @@ static void hog_notify_complete(struct bt_conn *conn, void *user_data) {
     struct k_work_delayable *work = (struct k_work_delayable *)user_data;
 #if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
     if (work == &hog_mouse_work) {
-        atomic_dec(&mouse_in_flight);
+        mouse_in_flight_release();
     }
 #endif
     k_work_reschedule(work, K_NO_WAIT);
@@ -685,7 +701,7 @@ void send_mouse_report_callback(struct k_work *work) {
             bt_conn_unref(conn);
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
             /* Roll back optimistic increment — completion CB won't fire. */
-            atomic_dec(&mouse_in_flight);
+            mouse_in_flight_release();
             mouse_coalesce_restore(&report);
 #endif
             if (++hog_mouse_retries > HOG_NOTIFY_MAX_RETRIES) {
@@ -713,7 +729,7 @@ void send_mouse_report_callback(struct k_work *work) {
 
         if (err) {
 #if IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
-            atomic_dec(&mouse_in_flight);
+            mouse_in_flight_release();
 #endif
             LOG_DBG("Error notifying %d", err);
         }
@@ -839,12 +855,23 @@ static void hog_host_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     LOG_INF("HOG host disconnect (reason 0x%02x), clearing HID state", reason);
 
-    /* Only the active profile's link carries notifies and the global HID
-     * state.  A background profile dropping must not wipe either, and must
-     * not touch the in-flight count: ATT skips the completion callback for
-     * notifies on a link that shut down, so the count is cleared for the
-     * active link only, where those callbacks are the ones that will never
-     * come. */
+#if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_ZMK_HOG_MOUSE_PIPELINE)
+    /* The in-flight slots belong to the link going down, whichever profile it
+     * was: ATT has already dropped their completion callbacks, so nobody else
+     * will ever return them.  Tying this to the *current* profile's address
+     * stranded them whenever the profile changed between the notify and the
+     * disconnect -- a BT_SEL while the trackpad was moving was enough -- and at
+     * PIPELINE_SIZE 2 two stranded slots shut the pointer down until a reboot,
+     * with nothing logged on any build.  Releasing slots that a still-live link
+     * owns is the cheaper mistake: it admits at most PIPELINE_SIZE extra
+     * notifies, which the host's flow control and the -ENOMEM path above
+     * already absorb. */
+    atomic_clear(&mouse_in_flight);
+#endif
+
+    /* The coalesce buffer and the global HID state, by contrast, belong to the
+     * active profile alone: a background profile dropping must not wipe
+     * either. */
     bt_addr_le_t *active_addr = zmk_ble_active_profile_addr();
     if (active_addr == NULL || !bt_addr_le_eq(info.le.dst, active_addr)) {
         return;
@@ -855,7 +882,6 @@ static void hog_host_disconnected(struct bt_conn *conn, uint8_t reason) {
         mouse_pending_clear_locked();
         k_spin_unlock(&mouse_coalesce_lock, key);
     }
-    atomic_clear(&mouse_in_flight);
 #endif
     zmk_endpoint_clear_reports();
 }
