@@ -95,6 +95,10 @@ struct peripheral_slot {
     uint8_t changed_positions[POSITION_STATE_DATA_LEN];
     /* Bug B: bounded retry counter for split_central_process_connection_work_handler */
     int conn_process_retries;
+    /* The peripheral rejected our stored key: forget its bond (see
+     * forget_bonds_handler), off the Bluetooth RX thread. */
+    bt_addr_le_t forget_addr;
+    bool forget_pending;
 };
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
@@ -1273,6 +1277,32 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
     }
 }
 
+/* A peripheral that answers our LE Start Encryption with "PIN or key missing"
+ * has no LTK for us while we still hold one for it: its bond is gone (a
+ * settings reset on that half alone, or an image whose Zephyr stores bond
+ * records in another layout and dropped ours as unreadable). The key we hold
+ * can never work again, and without this every reconnect failed the same way
+ * until this half was reset too. Forget the bond; bt_unpair() also drops the
+ * link, and the next connection pairs afresh (Just Works, as the first one
+ * did). The peripheral's address stays in its slot, so it is still ours.
+ * Deleting the bond writes flash: a work item, not the RX thread. */
+static void forget_bonds_handler(struct k_work *work) {
+    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+        if (!peripherals[i].forget_pending) {
+            continue;
+        }
+        peripherals[i].forget_pending = false;
+        int err = bt_unpair(BT_ID_DEFAULT, &peripherals[i].forget_addr);
+        if (err) {
+            LOG_WRN("Failed to forget the bond of peripheral %d (%d)", i, err);
+        } else {
+            LOG_WRN("Forgot the bond of peripheral %d; pairing again on reconnect", i);
+        }
+    }
+}
+
+static K_WORK_DEFINE(forget_bonds_work, forget_bonds_handler);
+
 static void split_central_security_changed(struct bt_conn *conn, bt_security_t level,
                                            enum bt_security_err err) {
     struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
@@ -1281,6 +1311,11 @@ static void split_central_security_changed(struct bt_conn *conn, bt_security_t l
     }
 
     if (err) {
+        if (err == BT_SECURITY_ERR_PIN_OR_KEY_MISSING) {
+            bt_addr_le_copy(&slot->forget_addr, bt_conn_get_dst(conn));
+            slot->forget_pending = true;
+            k_work_submit(&forget_bonds_work);
+        }
         LOG_ERR("Security failed for peripheral (err %d), disconnecting", err);
         bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
         return;
